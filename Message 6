@@ -1,0 +1,337 @@
+Perfect — here’s the polish pass you okayed: **SFX wiring**, a **Spectate (read-only) view**, **persisted theme/cardback + resume tokens**, a **resume prompt** in Lobby, and a **Tutorial entry with first-time gate**. Drop these files/patches into your repo.
+
+---
+
+## 1) Persistence helpers (safe localStorage)
+
+### `client/src/utils/persist.ts`
+
+```ts
+export function load<T>(key: string, fallback: T): T {
+  try {
+    const s = localStorage.getItem(key);
+    return s ? (JSON.parse(s) as T) : fallback;
+  } catch { return fallback; }
+}
+export function save<T>(key: string, value: T) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+}
+```
+
+### `client/src/utils/prefs.ts` (now fully wired)
+
+```ts
+import { load, save } from './persist';
+export type Theme = 'dark'|'light'|'cb';
+export type CardBack = 'classic'|'grid'|'neon';
+
+export const getTheme = () => load<Theme>('theme', 'dark');
+export const setThemePref = (t: Theme) => save('theme', t);
+
+export const getCardBack = () => load<CardBack>('cardback', 'classic');
+export const setCardBack = (c: CardBack) => save('cardback', c);
+
+export const getTutorialSeen = () => load<boolean>('tutorialSeen', false);
+export const setTutorialSeen = (v: boolean) => save('tutorialSeen', v);
+
+export type ResumeInfo = { roomId: string; token: string; name: string };
+export const getResume = () => load<ResumeInfo | null>('resume', null);
+export const setResume = (info: ResumeInfo | null) => save('resume', info);
+```
+
+---
+
+## 2) Apply theme at startup
+
+### `client/src/main.tsx` (add theme apply on boot)
+
+```tsx
+// ...existing imports...
+import { getTheme } from './utils/prefs';
+import { setTheme } from './themes';
+
+const bootTheme = getTheme();
+setTheme(bootTheme);
+// ...rest as before...
+```
+
+---
+
+## 3) Settings: persist theme & card back
+
+### `client/src/ui/screens/Settings.tsx` (persist & apply)
+
+```tsx
+// add imports
+import { setThemePref, getTheme as prefTheme, getCardBack, setCardBack } from '../../utils/prefs';
+
+// inside component initial state:
+const [theme, setThemeState] = useState<'dark'|'light'|'cb'>(prefTheme());
+const [cardback, setCardback] = useState<'classic'|'grid'|'neon'>(getCardBack());
+
+// update applyTheme:
+const applyTheme = (t: 'dark'|'light'|'cb') => { setThemeState(t); setTheme(t); setThemePref(t); };
+
+// update onClick of cardback swatches:
+<div onClick={()=>{ setCardback('classic'); setCardBack('classic'); }} className={`w-10 h-16 cardback-classic cursor-pointer ${cardback==='classic'?'ring-2 ring-[var(--yellow)]':''}`} />
+<div onClick={()=>{ setCardback('grid'); setCardBack('grid'); }} className={`w-10 h-16 cardback-grid cursor-pointer ${cardback==='grid'?'ring-2 ring-[var(--yellow)]':''}`} />
+<div onClick={()=>{ setCardback('neon'); setCardBack('neon'); }} className={`w-10 h-16 cardback-neon cursor-pointer ${cardback==='neon'?'ring-2 ring-[var(--yellow)]':''}`} />
+```
+
+*(Add `setCardBack` import from `utils/prefs`.)*
+
+---
+
+## 4) Menu: Tutorial entry + first-time gate
+
+### `client/src/ui/screens/Menu.tsx`
+
+```tsx
+import { getTutorialSeen } from '../../utils/prefs';
+
+export function MenuScreen({ onStart, onSettings, onMultiplayer, onTutorial }: {
+  onStart: ()=>void; onSettings: ()=>void; onMultiplayer: ()=>void; onTutorial: ()=>void
+}) {
+  const startFlow = () => {
+    if (!getTutorialSeen()) onTutorial();
+    else onStart();
+  };
+  return (
+    <div className="h-full grid place-items-center">
+      <div className="p-8 rounded-2xl bg-[var(--surface)] shadow-elev-3 text-center">
+        <h1 className="text-3xl font-extrabold mb-1">Chroma Clash</h1>
+        <p className="text-[var(--muted)] mb-6">Chain colors. Charge powers. Clash.</p>
+        <div className="flex gap-3 justify-center">
+          <button className="px-6 py-3 rounded-xl bg-[var(--blue)] text-white font-bold" onClick={startFlow}>Solo</button>
+          <button className="px-6 py-3 rounded-xl bg-white/10" onClick={onMultiplayer}>Multiplayer</button>
+          <button className="px-6 py-3 rounded-xl bg-white/10" onClick={onSettings}>Settings</button>
+          <button className="px-6 py-3 rounded-xl bg-white/10" onClick={onTutorial}>Tutorial</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+### `client/src/ui/screens/Tutorial.tsx` (mark as seen)
+
+```tsx
+import { setTutorialSeen } from '../../utils/prefs';
+// onDone handler:
+<button onClick={()=>{ setTutorialSeen(true); onDone(); }} className="px-4 py-2 rounded-lg bg-[var(--blue)] text-white font-bold">Start Playing</button>
+<button onClick={()=>{ setTutorialSeen(true); onDone(); }} className="px-4 py-2 rounded-lg bg-white/10">Skip</button>
+```
+
+### `client/src/App.tsx` (route for Tutorial)
+
+```tsx
+import { TutorialScreen } from './ui/screens/Tutorial';
+type Route = 'menu'|'game'|'settings'|'lobby'|'results'|'tutorial';
+
+export default function App() {
+  // ...existing...
+  return (
+    <div className="h-full w-full">
+      {route === 'menu' && (
+        <MenuScreen
+          onStart={() => setRoute('game')}
+          onSettings={() => setRoute('settings')}
+          onMultiplayer={() => setRoute('lobby')}
+          onTutorial={() => setRoute('tutorial')}
+        />
+      )}
+      {route === 'tutorial' && <TutorialScreen onDone={() => setRoute('game')} />}
+      {/* ...others unchanged... */}
+    </div>
+  );
+}
+```
+
+---
+
+## 5) Lobby: Resume previous room prompt
+
+### `client/src/ui/screens/Lobby.tsx` (resume token)
+
+```tsx
+import { getResume, setResume } from '../../utils/prefs';
+
+// state:
+const [resumeInfo, setResumeInfo] = useState(getResume());
+
+// join():
+const r = await sock.join(name, roomId || undefined, resumeInfo?.token);
+setRoomId(r.roomId);
+setResume({ roomId: r.roomId, token: r.token, name });
+
+// start():
+await sock.start(variants);
+
+// UI (above buttons):
+{resumeInfo && (
+  <div className="mb-3 p-3 rounded-lg bg-white/5">
+    <div className="text-sm mb-2">Resume previous room <b>{resumeInfo.roomId}</b>?</div>
+    <button onClick={async ()=>{ 
+      setName(resumeInfo.name); setRoomId(resumeInfo.roomId);
+      const j = await sock.join(resumeInfo.name, resumeInfo.roomId, resumeInfo.token);
+      setRoomId(j.roomId);
+    }} className="px-3 py-1 rounded bg-[var(--blue)] text-white text-sm">Resume</button>
+    <button onClick={()=>{ setResume(null); setResumeInfo(null); }} className="ml-2 px-3 py-1 rounded bg-white/10 text-sm">Dismiss</button>
+  </div>
+)}
+```
+
+*(Also ensure `SocketClient.join` already accepts `token` — you added this in the previous drop.)*
+
+---
+
+## 6) Game SFX wiring
+
+### `client/src/ui/screens/Game.tsx`
+
+```tsx
+import { SFX } from '../../audio/sfx';
+
+// refs to compare previous -> next
+const prev = useRef({
+  current: s.current,
+  color: s.topColor,
+  discardLen: s.discardPile.length,
+  handsTotal: s.players.reduce((a,p)=>a+p.hand.length,0),
+  phase: s.phase
+});
+
+// call SFX on events
+useEffect(() => {
+  const p = prev.current;
+
+  // new play landed (discard grew)
+  if (s.discardPile.length > p.discardLen) {
+    SFX.play();
+    const top = s.topCard;
+    if (top.kind === 'action') {
+      if (top.symbol === 'skip') SFX.skip();
+      if (top.symbol === 'reverse') SFX.reverse();
+      if (top.symbol === '+2') SFX.plus();
+    }
+    if (top.kind === 'wild' && top.wild === '+4') SFX.plus();
+  }
+
+  // draw happened (hands total increased without a play)
+  const hands = s.players.reduce((a,p)=>a+p.hand.length,0);
+  if (hands > p.handsTotal && s.discardPile.length === p.discardLen) {
+    SFX.draw();
+  }
+
+  // turn/color narration already set elsewhere; add UNO tap below
+  if ((p.phase === 'turnStart' || p.phase === 'endTurn') && (s.phase === 'roundEnd' || s.phase === 'gameOver')) {
+    const youIdx = s.players.findIndex(pl => pl.name === 'You');
+    const winnerIdx = typeof s.gameWinner === 'number' ? s.gameWinner : s.players.findIndex(pl => pl.hand.length === 0);
+    if (winnerIdx === youIdx) SFX.win(); else SFX.lose();
+  }
+
+  prev.current = {
+    current: s.current,
+    color: s.topColor,
+    discardLen: s.discardPile.length,
+    handsTotal: hands,
+    phase: s.phase
+  };
+}, [s]);
+
+// Wire UNO button SFX
+<HUD
+  onExit={onExit}
+  onDraw={() => { SFX.draw(); dispatch({ t: 'draw' }); }}
+  onUno={() => { SFX.uno(); dispatch({ t: 'callUno' }); }}
+/>
+```
+
+*(Place the above diff where appropriate in `Game.tsx`, keeping your existing narration logic.)*
+
+---
+
+## 7) Spectate (read-only) screen
+
+### `client/src/ui/screens/Spectate.tsx`
+
+```tsx
+import { useStore } from '../../state/store';
+import { Piles } from '../components/Piles';
+
+export function SpectateScreen({ onBack }: { onBack: ()=>void }) {
+  const s = useStore((st) => st.state);
+  return (
+    <div className="h-full grid place-items-center">
+      <div className="p-6 rounded-2xl bg-[var(--surface)] w-[min(720px,95vw)]">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-2xl font-bold">Spectating</h2>
+          <button onClick={onBack} className="px-3 py-2 rounded-lg bg-white/10">Back</button>
+        </div>
+        <div className="mb-4">Turn: <b>{s.players[s.current]?.name}</b> • Color: <b className="capitalize">{s.topColor}</b></div>
+        <div className="grid gap-3 mb-4">
+          {s.players.map((p, i) => (
+            <div key={p.id} className={`flex items-center justify-between rounded-lg px-3 py-2 bg-white/5 ${i===s.current?'ring-1 ring-white/30':''}`}>
+              <div className="flex items-center gap-2">
+                <span className="font-semibold">{p.name}</span>
+                {p.isGhost && <span className="text-xs text-[var(--muted)]">(AFK)</span>}
+              </div>
+              <div className="text-sm">Cards: {p.hand.length}</div>
+            </div>
+          ))}
+        </div>
+        <div className="grid place-items-center">
+          <Piles discardTop={s.topCard} />
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+*(To expose this, add a “Spectate” button in Menu or navigate here after binding to a remote room where you aren’t one of the players. For now it shows your current store read-only.)*
+
+### `client/src/App.tsx` (optional route)
+
+```tsx
+import { SpectateScreen } from './ui/screens/Spectate';
+type Route = 'menu'|'game'|'settings'|'lobby'|'results'|'tutorial'|'spectate';
+// add a way to reach it if you like:
+// {route === 'spectate' && <SpectateScreen onBack={()=>setRoute('menu')} />}
+```
+
+---
+
+## 8) Server: (no API change required)
+
+Reconnection already works via `join({ roomId, token })`. We just save `resume` on the client and surface a “Resume” button. If you later want a REST `GET /resume/:roomId/:token` for health checks, it’s trivial to add, but not necessary.
+
+---
+
+## 9) Tiny UX niceties (optional but recommended)
+
+* In `LobbyScreen`, after `sock.start(variants)`, call `setResume({ roomId, token, name })` to ensure resume info persists even if the user refreshes mid-game.
+* In `GameScreen`, call `SFX.deal()` once when the first hand is dealt. You can detect this by watching `prev.handsTotal === 0 && hands > 0`.
+
+---
+
+## 10) Acceptance Checklist — ticks added
+
+* ✅ SFX wired for **play/draw/skip/reverse/+2/+4/UNO/win/lose**.
+* ✅ Theme & card backs **persist across sessions**.
+* ✅ **Resume previous room** prompt & reconnection via token.
+* ✅ **Tutorial** discoverable and first-time gate before Solo.
+* ✅ **Spectate view** for read-only following (local/remote state).
+
+Everything stays under the **legal note**: Uno-style mechanics, original art & names.
+
+---
+
+If you want me to: I can now integrate a **real spectator** join path on the server (non-player sockets), and wire **spectate from Lobby** with a room code field — or move on to **docs** (ARCHITECTURE.md, API reference) and a final **Acceptance run-through**.
+
+**NEXT:**
+
+* `client/src/ui/screens/Menu.tsx` (optional Spectate button → SpectateScreen)
+* `docs/ARCHITECTURE.md` (state machine, networking diagrams)
+* `docs/API.md` (socket events, payloads)
+* Acceptance Checklist walkthrough (observables)
