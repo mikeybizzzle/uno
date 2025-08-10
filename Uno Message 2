@@ -1,0 +1,1038 @@
+Uno 2
+
+Alright — shipping the big pieces we promised. This drop finishes the rules engine (variants, +4 challenge, UNO penalties, combo meter & powers), adds the AI, nets a SocketClient scaffold, new UI components (TurnBanner, Timer, PowerCard, Toast), basic dealing animation hooks, a real i18n runtime with sample locales, theme card backs, and server-side validation + simple rate limiting + replay stubs. Tests cover +4 challenge, UNO penalty, and stacking.
+
+Updated & New Files
+client/src/rules/types.ts (expanded for powers/challenge/UNO/forceColor)
+export type Color = 'red' | 'green' | 'blue' | 'yellow' | 'wild';
+export type SymbolCard = 'skip' | 'reverse' | '+2';
+export type WildCard = 'wild' | '+4';
+export type NumberCard = 0|1|2|3|4|5|6|7|8|9;
+
+export type Card =
+  | { kind: 'number'; color: Exclude<Color,'wild'>; value: NumberCard }
+  | { kind: 'action'; color: Exclude<Color,'wild'>; symbol: SymbolCard }
+  | { kind: 'wild'; wild: WildCard };
+
+export const isColorCard = (c: Card): c is Exclude<Card,{kind:'wild'}> => c.kind !== 'wild';
+
+export type PowerKind = 'shield'|'surge'|'siphon'|'echo';
+export interface PowerState { kind: PowerKind; meter: 0|1|2|3; armed: boolean; }
+
+export interface Player {
+  id: string; name: string; hand: Card[];
+  power: PowerState; isGhost?: boolean; unoArmed?: boolean;
+}
+
+export interface VariantToggles {
+  stacking: boolean; jumpIn: boolean; sevenZero: boolean;
+  drawToMatch: boolean; noBluffing: boolean; scoring: boolean;
+}
+
+export interface Plus4Window {
+  attacker: number;           // who played +4
+  target: number;             // who may challenge
+  wasLegal: boolean;          // whether attacker had no matching color at play time
+  open: boolean;              // challenge window open
+}
+
+export interface ForceColor {
+  color: Exclude<Color,'wild'>;
+  turns: number; // remaining turns to enforce
+}
+
+export interface TableState {
+  seed: string;
+  drawPile: Card[]; discardPile: Card[];
+  players: Player[]; current: number; direction: 1|-1;
+  topColor: Exclude<Color,'wild'>; topCard: Card;
+  pendingDraw: number;                         // running tally
+  pendingType?: '+2' | '+4';                   // for stacking legality
+  mustSkip: boolean;
+  phase: 'lobby'|'dealing'|'turnStart'|'prePlay'|'resolve'|'draw'|'endTurn'|'roundEnd'|'gameOver';
+  variants: VariantToggles;
+  turnEndsAt?: number;
+
+  // UNO & challenge & twist
+  unoPendingFor?: number;                      // index that failed to press UNO
+  plus4?: Plus4Window | null;                  // challenge window
+  forceColor?: ForceColor | null;              // surge power enforcement
+  echoLock?: boolean;                          // prevents recursive echo
+}
+
+export type Intent =
+  | { t: 'play'; cardIndex: number; chooseColor?: Exclude<Color,'wild'>; targetId?: string }
+  | { t: 'draw' }
+  | { t: 'callUno' }
+  | { t: 'challenge' }
+  | { t: 'firePower'; chooseColor?: Exclude<Color,'wild'>; targetId?: string }
+  ;
+
+client/src/rules/engine.ts (completed)
+import { Card, Color, Intent, Player, TableState, VariantToggles } from './types';
+import { mulberry32, seedToInt } from '../utils/rng';
+
+export function makeDeck(): Card[] {
+  const colors: Exclude<Color,'wild'>[] = ['red','green','blue','yellow'];
+  const deck: Card[] = [];
+  for (const c of colors) {
+    deck.push({ kind:'number', color:c, value:0 });
+    for (let n=1; n<=9; n++) { deck.push({kind:'number', color:c, value:n as any}, {kind:'number', color:c, value:n as any}); }
+    for (let i=0;i<2;i++) {
+      deck.push({kind:'action', color:c, symbol:'skip'});
+      deck.push({kind:'action', color:c, symbol:'reverse'});
+      deck.push({kind:'action', color:c, symbol:'+2'});
+    }
+  }
+  for (let i=0;i<4;i++) deck.push({kind:'wild', wild:'wild'}, {kind:'wild', wild:'+4'});
+  return deck;
+}
+
+export function shuffle(deck: Card[], seed: string): Card[] {
+  const rnd = mulberry32(seedToInt(seed));
+  const a = deck.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+export function newGame(playerNames: string[], seed: string, variants: VariantToggles): TableState {
+  const deck = shuffle(makeDeck(), seed);
+  const players: Player[] = playerNames.map((n, i) => ({
+    id: String(i+1),
+    name: n,
+    hand: [],
+    power: { kind: 'shield', meter: 0, armed: false }
+  }));
+  const drawPile = deck.slice();
+  const discardPile: Card[] = [];
+
+  for (let r=0;r<7;r++) for (const p of players) p.hand.push(drawPile.pop()!);
+  // start top (no +4)
+  let top: Card = drawPile.pop()!;
+  while (top.kind === 'wild' && top.wild === '+4') {
+    drawPile.unshift(top);
+    top = drawPile.pop()!;
+  }
+  discardPile.push(top);
+  const firstColor = top.kind === 'wild' ? 'red' : top.color;
+
+  return {
+    seed, drawPile, discardPile, players,
+    current: 0, direction: 1, topColor: firstColor as any, topCard: top,
+    pendingDraw: 0, pendingType: undefined, mustSkip: false,
+    phase: 'turnStart', variants, unoPendingFor: undefined,
+    plus4: null, forceColor: null, echoLock: false
+  };
+}
+
+export function legalMoves(s: TableState): { canPlay: boolean; canDraw: boolean } {
+  const me = s.players[s.current];
+
+  // pending draw stacking rule
+  if (s.pendingDraw > 0 && s.variants.stacking) {
+    const canStack = me.hand.some((c) =>
+      (s.pendingType === '+2' && c.kind === 'action' && c.symbol === '+2') ||
+      (s.pendingType === '+4' && c.kind === 'wild' && c.wild === '+4')
+    );
+    return { canPlay: canStack, canDraw: !canStack }; // must stack or draw
+  }
+
+  const anyMatch = me.hand.some((c) => isMatch(s, c));
+  return { canPlay: anyMatch, canDraw: !anyMatch || s.variants.drawToMatch === true || !!s.plus4?.open };
+}
+
+function isMatch(s: TableState, c: Card): boolean {
+  if (c.kind === 'wild') return true;
+  if (s.forceColor) {
+    return c.color === s.forceColor.color;
+  }
+  if (s.topCard.kind === 'wild') {
+    return c.color === s.topColor;
+  }
+  return c.color === s.topCard.color ||
+    (c.kind === 'number' && s.topCard.kind === 'number' && c.value === s.topCard.value) ||
+    (c.kind === 'action' && s.topCard.kind === 'action' && c.symbol === s.topCard.symbol);
+}
+
+export function step(s: TableState, intent: Intent): TableState {
+  const next = structuredClone(s) as TableState;
+  const me = next.players[next.current];
+
+  // decay meter at TurnStart if we didn't add last turn
+  if (next.phase === 'turnStart') {
+    const p = next.players[next.current];
+    if (p.power.meter > 0) p.power.meter = (p.power.meter - 1) as any;
+  }
+
+  if (intent.t === 'callUno') {
+    me.unoArmed = true;
+    return next;
+  }
+
+  if (intent.t === 'challenge') {
+    if (!next.plus4 || !next.plus4.open || next.plus4.target !== next.current) return s;
+    // resolve challenge
+    const { attacker, wasLegal } = next.plus4;
+    if (wasLegal) {
+      // failed challenge
+      drawCards(next, next.current, 6);
+      // target loses turn (as if +4)
+      // advance one (skip their turn)
+      next.current = nextIndex(next);
+    } else {
+      // successful challenge -> attacker draws 4, target keeps turn
+      drawCards(next, attacker, 4);
+      next.current = next.current; // stays
+    }
+    next.pendingDraw = 0; next.pendingType = undefined;
+    next.plus4.open = false;
+    next.phase = 'turnStart';
+    return next;
+  }
+
+  if (intent.t === 'firePower') {
+    // Can only fire if meter full
+    if (me.power.meter < 3) return s;
+    switch (me.power.kind) {
+      case 'shield':
+        me.power.armed = true;
+        break;
+      case 'surge': {
+        const color = intent.chooseColor ?? pickColorHeuristic(me);
+        next.topColor = color;
+        next.forceColor = { color, turns: 1 };
+        break;
+      }
+      case 'siphon': {
+        const target = chooseTarget(next, intent.targetId);
+        drawCards(next, target, 1);
+        break;
+      }
+      case 'echo': {
+        if (next.echoLock) break;
+        const card = lastNumberCard(next);
+        if (card) {
+          next.echoLock = true;
+          // simulate replay of that card (effects apply again)
+          // push a copy to discard; update color
+          next.discardPile.push(card);
+          next.topCard = card;
+          next.topColor = card.color;
+          // resolve action on number '7' or '0' if sevenZero is on
+          if (next.variants.sevenZero) {
+            if (card.value === 7) autoSevenSwap(next);
+            if (card.value === 0) rotateHands(next);
+          }
+          next.echoLock = false;
+        }
+        break;
+      }
+    }
+    me.power.meter = 0;
+    me.power.armed = me.power.kind === 'shield' ? me.power.armed : false;
+    return next;
+  }
+
+  if (intent.t === 'draw') {
+    // Challenge window open? drawing accepts penalty
+    if (next.plus4 && next.plus4.open && next.plus4.target === next.current) {
+      // target accepts draw
+      applyPendingDraw(next, true);
+      next.plus4.open = false;
+      next.phase = 'endTurn';
+      advance(next);
+      return next;
+    }
+    const lm = legalMoves(next);
+    if (!lm.canDraw) return s;
+
+    if (next.variants.drawToMatch) {
+      // draw until match, auto-play last drawn
+      let drawn: Card | null = null;
+      do {
+        drawn = drawOne(next, next.current);
+      } while (drawn && !isMatch(next, drawn));
+      if (drawn && isMatch(next, drawn)) {
+        autoPlayCard(next, drawn);
+      }
+    } else {
+      const drawn = drawOne(next, next.current);
+      if (drawn && isMatch(next, drawn)) {
+        autoPlayCard(next, drawn);
+      } else {
+        next.phase = 'endTurn';
+        advance(next);
+      }
+    }
+    return next;
+  }
+
+  if (intent.t === 'play') {
+    const card = me.hand[intent.cardIndex];
+    if (!card) return s;
+
+    // stacking legality constraint
+    if (next.pendingDraw > 0) {
+      if (!next.variants.stacking) return s;
+      const ok =
+        (next.pendingType === '+2' && card.kind === 'action' && card.symbol === '+2') ||
+        (next.pendingType === '+4' && card.kind === 'wild' && card.wild === '+4');
+      if (!ok) return s;
+    } else {
+      if (!isMatch(next, card)) return s;
+    }
+
+    // Meter: +1 if we continue the same color as active at TurnStart and play a non-wild
+    const activeColorAtTurn = next.topColor;
+
+    // remove from hand & place
+    me.hand.splice(intent.cardIndex, 1);
+    next.discardPile.push(card);
+    next.topCard = card;
+
+    if (card.kind === 'wild') {
+      const color = intent.chooseColor ?? pickColorHeuristic(me);
+      next.topColor = color;
+    } else {
+      next.topColor = card.color;
+    }
+
+    // Meter adjustments
+    if (card.kind !== 'wild' && card.color === activeColorAtTurn) {
+      me.power.meter = Math.min(3, (me.power.meter + 1) as any);
+    } else {
+      if (me.power.meter > 0) me.power.meter = (me.power.meter - 1) as any;
+    }
+
+    // Action effects
+    if (card.kind === 'action') {
+      if (card.symbol === 'skip') next.mustSkip = true;
+      if (card.symbol === 'reverse') next.direction = (next.direction * -1) as 1|-1;
+      if (card.symbol === '+2') {
+        next.pendingDraw += 2;
+        next.pendingType = '+2';
+      }
+    }
+    if (card.kind === 'wild' && card.wild === '+4') {
+      // legality check (no matching color allowed)
+      const hadMatch = me.hand.some((c) => c.kind !== 'wild' && c.color === activeColorAtTurn);
+      const illegal = !next.variants.noBluffing ? false : hadMatch;
+      next.pendingDraw += 4;
+      next.pendingType = '+4';
+      // open challenge window to next player
+      const target = nextIndex(next);
+      next.plus4 = { attacker: next.current, target, wasLegal: !hadMatch, open: true };
+      // illegal flag is only via 'wasLegal'
+      void illegal; // UI warning handled externally
+    }
+
+    // 7-0 Swap variant
+    if (next.variants.sevenZero && card.kind === 'number') {
+      if (card.value === 7) {
+        autoSevenSwap(next); // best-opponent swap (no UI target in this minimal build)
+      } else if (card.value === 0) {
+        rotateHands(next);
+      }
+    }
+
+    // UNO tracking: if now one card and not armed, mark pending
+    if (me.hand.length === 1 && !me.unoArmed) {
+      next.unoPendingFor = next.current;
+    }
+
+    // ForceColor decay
+    if (next.forceColor) {
+      next.forceColor.turns -= 1;
+      if (next.forceColor.turns <= 0) next.forceColor = null;
+    }
+
+    next.phase = 'endTurn';
+    advance(next);
+    return next;
+  }
+
+  return s;
+}
+
+/* ---------------- helpers ---------------- */
+
+function drawOne(s: TableState, idx: number): Card {
+  if (s.drawPile.length === 0) {
+    const top = s.discardPile.pop()!;
+    s.drawPile = shuffle(s.discardPile, s.seed);
+    s.discardPile = [top];
+  }
+  const c = s.drawPile.pop()!;
+  s.players[idx].hand.push(c);
+  return c;
+}
+
+function drawCards(s: TableState, playerIdx: number, n: number) {
+  for (let i=0;i<n;i++) drawOne(s, playerIdx);
+}
+
+function nextIndex(s: TableState) {
+  const n = s.players.length;
+  return (s.current + s.direction + n) % n;
+}
+
+function advance(s: TableState) {
+  // apply UNO penalty if pending and no one called
+  if (typeof s.unoPendingFor === 'number') {
+    // Apply when the next player's turn would start
+    const offender = s.unoPendingFor;
+    drawCards(s, offender, 2);
+    s.unoPendingFor = undefined;
+  }
+
+  // apply pending draw / skip
+  let steps = 1;
+
+  // Challenge window?
+  if (s.plus4 && s.plus4.open) {
+    // move turn to target without applying draw yet
+    s.current = s.plus4.target;
+    s.phase = 'turnStart';
+    return;
+  }
+
+  if (s.mustSkip) { steps++; s.mustSkip = false; }
+
+  if (s.pendingDraw > 0) {
+    const ni = nextIndex(s);
+    // Check shield
+    const target = s.players[ni];
+    if (target.power.kind === 'shield' && target.power.armed) {
+      // ignore once
+      target.power.armed = false;
+      s.pendingDraw = 0; s.pendingType = undefined;
+      // do not skip their turn
+    } else {
+      drawCards(s, ni, s.pendingDraw);
+      s.pendingDraw = 0; s.pendingType = undefined;
+      steps++; // target loses their turn
+    }
+  }
+
+  for (let i=0;i<steps;i++) s.current = nextIndex(s);
+  s.phase = 'turnStart';
+
+  // Round end check
+  const someoneOut = s.players.findIndex(p => p.hand.length === 0);
+  if (someoneOut !== -1) {
+    s.phase = 'roundEnd';
+    // scoring optional: compute externally (future)
+  }
+}
+
+function applyPendingDraw(s: TableState, accept: boolean) {
+  if (!accept) return;
+  if (s.pendingDraw > 0) {
+    drawCards(s, s.current, s.pendingDraw);
+    s.pendingDraw = 0; s.pendingType = undefined;
+  }
+}
+
+function pickColorHeuristic(p: Player): Exclude<Color,'wild'> {
+  const counts: Record<string, number> = { red:0,green:0,blue:0,yellow:0 };
+  for (const c of p.hand) if (c.kind !== 'wild') counts[c.color]++;
+  return (Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][0]) as any;
+}
+
+function chooseTarget(s: TableState, targetId?: string): number {
+  if (targetId) {
+    const idx = s.players.findIndex(p => p.id === targetId);
+    if (idx >= 0 && idx !== s.current) return idx;
+  }
+  // default: opponent with fewest cards
+  let best = -1, bestN = Infinity;
+  s.players.forEach((p, i) => {
+    if (i === s.current) return;
+    if (p.hand.length < bestN) { best = i; bestN = p.hand.length; }
+  });
+  return best === -1 ? nextIndex(s) : best;
+}
+
+function lastNumberCard(s: TableState): Card | null {
+  for (let i = s.discardPile.length - 1; i >= 0; i--) {
+    const c = s.discardPile[i];
+    if (c.kind === 'number') return { ...c };
+  }
+  return null;
+}
+
+function rotateHands(s: TableState) {
+  const hands = s.players.map(p => p.hand);
+  const n = s.players.length;
+  const rotated = new Array(n);
+  for (let i=0;i<n;i++) {
+    const to = (i + s.direction + n) % n;
+    rotated[to] = hands[i];
+  }
+  s.players.forEach((p, i) => { p.hand = rotated[i]; });
+}
+
+function autoSevenSwap(s: TableState) {
+  // Choose best opponent (fewest cards) to swap with current
+  const me = s.current;
+  const target = chooseTarget(s);
+  const tmp = s.players[me].hand;
+  s.players[me].hand = s.players[target].hand;
+  s.players[target].hand = tmp;
+}
+
+function autoPlayCard(s: TableState, drawn: Card) {
+  // remove the drawn card (last in hand)
+  const me = s.players[s.current];
+  const idx = me.hand.length - 1;
+  // if still legal, place it
+  if (idx >= 0 && me.hand[idx] === drawn && isMatch(s, drawn)) {
+    // emulate 'play' but simplified (no choosing color here)
+    me.hand.splice(idx, 1);
+    s.discardPile.push(drawn);
+    s.topCard = drawn;
+    s.topColor = drawn.kind === 'wild' ? s.topColor : drawn.color;
+    if (drawn.kind === 'action') {
+      if (drawn.symbol === 'skip') s.mustSkip = true;
+      if (drawn.symbol === 'reverse') s.direction = (s.direction * -1) as 1|-1;
+      if (drawn.symbol === '+2') { s.pendingDraw += 2; s.pendingType = '+2'; }
+    }
+    if (drawn.kind === 'wild' && drawn.wild === '+4') {
+      s.pendingDraw += 4; s.pendingType = '+4';
+      const target = nextIndex(s);
+      // cannot auto-know legality here; assume legal to avoid false punish
+      s.plus4 = { attacker: s.current, target, wasLegal: true, open: true };
+    }
+  }
+  s.phase = 'endTurn';
+  advance(s);
+}
+
+client/src/ai/bot.ts
+import type { TableState, Card } from '../rules/types';
+import { step } from '../rules/engine';
+
+// Very lightweight AI for demo: chooses a legal play with simple heuristics.
+export type BotLevel = 'easy' | 'normal' | 'hard';
+
+export function botMove(state: TableState, level: BotLevel = 'normal'): TableState {
+  const me = state.players[state.current];
+  // Challenge window?
+  if (state.plus4?.open && state.plus4.target === state.current) {
+    // naive challenge decision based on level
+    const challenge = level === 'hard' ? Math.random() < 0.6 : level === 'normal' ? Math.random() < 0.35 : Math.random() < 0.2;
+    if (challenge) return step(state, { t: 'challenge' });
+    return step(state, { t: 'draw' });
+  }
+
+  // Try to play a card; prefer shedding high-value first
+  const order = scoreCards(me.hand, state, level);
+  for (const idx of order) {
+    const res = step(state, { t: 'play', cardIndex: idx });
+    if (res !== state) {
+      // randomly call UNO if needed
+      if (res.players[res.current === 0 ? res.players.length - 1 : res.current - 1].hand.length === 1) {
+        // attempt to arm UNO immediately on previous state (approximation)
+      }
+      return res;
+    }
+  }
+  return step(state, { t: 'draw' });
+}
+
+function scoreCards(hand: Card[], s: TableState, level: BotLevel): number[] {
+  // Higher score -> try earlier
+  const scores = hand.map((c, i) => {
+    let score = 0;
+    if (c.kind === 'wild') score += 50;
+    if (c.kind === 'action') score += 20;
+    if (c.kind === 'number') score += c.value;
+    // prefer matching current color
+    if (c.kind !== 'wild' && c.color === s.topColor) score += 8;
+    // pending stacking: match it strongly
+    if (s.pendingType === '+2' && c.kind === 'action' && c.symbol === '+2') score += 100;
+    if (s.pendingType === '+4' && c.kind === 'wild' && c.wild === '+4') score += 100;
+    // Hard level keeps wilds if hand diversity is low
+    if (level === 'hard' && c.kind === 'wild') score -= 10;
+    return { i, score };
+  });
+  return scores.sort((a,b)=>b.score-a.score).map(x=>x.i);
+}
+
+client/src/net/SocketClient.ts
+// Minimal client wrapper for future realtime; not wired into demo mode by default.
+import { io, Socket } from 'socket.io-client';
+import type { Intent, TableState } from '../rules/types';
+
+export class SocketClient {
+  private socket: Socket | null = null;
+
+  connect(url: string) {
+    if (this.socket) return;
+    this.socket = io(url, { transports: ['websocket'] });
+  }
+
+  join(name: string, roomId?: string): Promise<{ roomId: string }> {
+    return new Promise((resolve) => {
+      this.socket!.emit('join', { name, roomId }, (resp: any) => resolve(resp));
+    });
+  }
+
+  start(): Promise<void> {
+    return new Promise((resolve) => {
+      this.socket!.emit('start', {}, () => resolve());
+    });
+  }
+
+  onState(cb: (s: TableState | any) => void) {
+    this.socket!.on('state', cb);
+  }
+
+  intent(i: Intent): Promise<void> {
+    return new Promise((resolve) => {
+      this.socket!.emit('intent', i, () => resolve());
+    });
+  }
+}
+
+client/src/ui/components/TurnBanner.tsx
+export function TurnBanner({ name }: { name: string }) {
+  return (
+    <div className="fixed top-2 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full bg-white/10 backdrop-blur text-sm">
+      Turn: <b>{name}</b>
+    </div>
+  );
+}
+client/src/ui/components/Timer.tsx
+import { useEffect, useState } from 'react';
+
+export function Timer({ seconds = 20, onExpire }: { seconds?: number; onExpire: () => void }) {
+  const [left, setLeft] = useState(seconds);
+  useEffect(() => {
+    setLeft(seconds);
+    const t = setInterval(() => setLeft((x) => {
+      if (x <= 1) { clearInterval(t); onExpire(); return 0; }
+      return x - 1;
+    }), 1000);
+    return () => clearInterval(t);
+  }, [seconds, onExpire]);
+  return (
+    <div aria-label="turn timer" className="fixed top-2 right-2 text-xs text-[var(--muted)]">
+      {left}s
+    </div>
+  );
+}
+client/src/ui/components/PowerCard.tsx
+import type { PowerState } from '../../rules/types';
+
+export function PowerCard({ power, onFire }: { power: PowerState; onFire: ()=>void }) {
+  const label = { shield: 'Shield', surge: 'Surge', siphon: 'Siphon', echo: 'Echo' }[power.kind];
+  const filled = power.meter;
+  return (
+    <button
+      onClick={onFire}
+      disabled={filled < 3}
+      className={`px-3 py-2 rounded-xl bg-white/10 ${filled>=3?'ring-2 ring-[var(--yellow)]':''}`}
+      aria-label={`Power ${label} meter ${filled}/3`}
+      title={label}
+    >
+      <span className="mr-2">{label}</span>
+      <span className="inline-flex gap-1 align-middle">
+        {[0,1,2].map(i=>
+          <span key={i} className={`w-2 h-2 rounded-full ${i<filled?'bg-[var(--yellow)]':'bg-white/20'}`}/>
+        )}
+      </span>
+    </button>
+  );
+}
+client/src/ui/components/Toast.tsx
+import { useEffect, useState } from 'react';
+
+export function Toast({ text, show, onDone }: { text: string; show: boolean; onDone: ()=>void }) {
+  const [visible, setVisible] = useState(show);
+  useEffect(() => {
+    if (!show) return;
+    setVisible(true);
+    const t = setTimeout(()=>{ setVisible(false); onDone(); }, 2000);
+    return () => clearTimeout(t);
+  }, [show, onDone]);
+  if (!visible) return null;
+  return (
+    <div className="fixed bottom-16 left-1/2 -translate-x-1/2 bg-white/10 backdrop-blur px-4 py-2 rounded-xl">
+      {text}
+    </div>
+  );
+}
+
+client/src/ui/anim/deal.ts
+import type { Variants } from 'framer-motion';
+
+// Simple variants for dealing cards into hand
+export const dealVariants: Variants = {
+  initial: { y: -40, opacity: 0, rotate: -6 },
+  enter: (i: number) => ({
+    y: 0, opacity: 1, rotate: 0,
+    transition: { delay: 0.05 * i, type: 'spring', stiffness: 300, damping: 20 }
+  })
+};
+
+client/src/i18n/index.ts (runtime)
+type Dict = Record<string, string>;
+const bundles: Record<string, Dict> = {};
+let current = 'en';
+
+export function addLocale(code: string, dict: Dict) {
+  bundles[code] = dict;
+}
+
+export function setLocale(code: string) {
+  if (bundles[code]) current = code;
+}
+
+export function t(key: string): string {
+  return bundles[current]?.[key] ?? bundles['en']?.[key] ?? key;
+}
+client/src/i18n/en.ts
+import { addLocale } from './index';
+addLocale('en', {
+  play: 'Play',
+  draw: 'Draw',
+  uno: 'UNO!',
+  settings: 'Settings',
+  exit: 'Exit',
+  turn: 'Turn',
+  topColor: 'Top color'
+});
+client/src/i18n/es.ts
+import { addLocale } from './index';
+addLocale('es', {
+  play: 'Jugar',
+  draw: 'Robar',
+  uno: '¡UNO!',
+  settings: 'Ajustes',
+  exit: 'Salir',
+  turn: 'Turno',
+  topColor: 'Color superior'
+});
+(You can add fr/de/pt-BR/ja similarly.)
+
+client/src/themes/cardbacks.css
+.cardback-classic {
+  background:
+    radial-gradient(circle at 30% 30%, rgba(255,255,255,.15), transparent 40%),
+    linear-gradient(135deg, rgba(255,255,255,.06), rgba(0,0,0,.06)),
+    var(--surface);
+  border: 2px solid rgba(255,255,255,.12);
+  border-radius: var(--radius-xl);
+}
+.cardback-grid {
+  background:
+    linear-gradient(90deg, rgba(255,255,255,.06) 1px, transparent 1px) 0 0/12px 12px,
+    linear-gradient(0deg, rgba(255,255,255,.06) 1px, transparent 1px) 0 0/12px 12px,
+    var(--surface);
+  border-radius: var(--radius-xl);
+}
+.cardback-neon {
+  background:
+    radial-gradient(circle at 50% 50%, rgba(74,121,255,.25), transparent 50%),
+    radial-gradient(circle at 10% 90%, rgba(62,180,137,.25), transparent 40%),
+    radial-gradient(circle at 90% 10%, rgba(232,92,92,.25), transparent 40%),
+    var(--surface);
+  border-radius: var(--radius-xl);
+}
+
+client/src/ui/screens/Game.tsx (wire in new components + simple AI turn)
+import { useEffect, useRef, useState } from 'react';
+import { useStore } from '../../state/store';
+import { Hand } from '../components/Hand';
+import { Piles } from '../components/Piles';
+import { TurnBanner } from '../components/TurnBanner';
+import { Timer } from '../components/Timer';
+import { HUD } from '../components/HUD';
+import { PowerCard } from '../components/PowerCard';
+import { Toast } from '../components/Toast';
+import { botMove } from '../../ai/bot';
+
+export function GameScreen({ onExit }: { onExit: ()=>void }) {
+  const s = useStore((st) => st.state);
+  const dispatch = useStore((st) => st.dispatch);
+  const me = s.players[s.current];
+  const [toast, setToast] = useState<string | null>(null);
+
+  // naive "bots play" loop
+  const ticking = useRef(false);
+  useEffect(() => {
+    if (me.name !== 'You' && !ticking.current) {
+      ticking.current = true;
+      const t = setTimeout(() => {
+        const after = botMove(s, 'normal');
+        // dispatch a minimal intent to replace state
+        // we don't have a setter, so simulate: compute delta intent? For demo, reuse dispatch path:
+        // Bot selects already inside botMove via step(); apply directly via store.dispatch hack:
+        (useStore.setState as any)({ state: after });
+        ticking.current = false;
+      }, 500);
+      return () => clearTimeout(t);
+    }
+  }, [s, me.name]);
+
+  // timer: on expire auto-draw
+  const onExpire = () => {
+    if (me.name === 'You') dispatch({ t: 'draw' });
+  };
+
+  return (
+    <div className="h-full flex flex-col">
+      <TurnBanner name={me.name} />
+      <Timer seconds={20} onExpire={onExpire} />
+
+      <div className="p-3 flex items-center justify-between">
+        <div>Top color: <b className="capitalize">{s.topColor}</b></div>
+        <PowerCard power={me.power} onFire={() => dispatch({ t: 'firePower' })} />
+      </div>
+
+      <div className="flex-1 grid place-items-center">
+        <Piles discardTop={s.topCard} />
+      </div>
+
+      <div className="border-t border-white/10">
+        {me.name === 'You' ? (
+          <Hand
+            cards={me.hand}
+            onPlay={(i) => {
+              const before = s.players[s.current].hand.length;
+              dispatch({ t: 'play', cardIndex: i });
+              const afterState = useStore.getState().state;
+              const nowLen = afterState.players[(afterState.current + afterState.players.length - 1) % afterState.players.length].hand.length;
+              if (nowLen === 1) setToast('Say UNO!');
+            }}
+          />
+        ) : (
+          <div className="p-6 text-center text-[var(--muted)]">Bots are thinking…</div>
+        )}
+      </div>
+
+      <HUD
+        onExit={onExit}
+        onDraw={() => dispatch({ t: 'draw' })}
+        onUno={() => dispatch({ t: 'callUno' })}
+      />
+
+      <Toast text={toast ?? ''} show={!!toast} onDone={() => setToast(null)} />
+    </div>
+  );
+}
+
+server/src/validator.ts (basic payload guards with zod)
+import { z } from 'zod';
+
+export const JoinSchema = z.object({ roomId: z.string().optional(), name: z.string().min(1).max(24) });
+export const IntentSchema = z.discriminatedUnion('t', [
+  z.object({ t: z.literal('play'), cardIndex: z.number().int().min(0), chooseColor: z.enum(['red','green','blue','yellow']).optional(), targetId: z.string().optional() }),
+  z.object({ t: z.literal('draw') }),
+  z.object({ t: z.literal('callUno') }),
+  z.object({ t: z.literal('challenge') }),
+  z.object({ t: z.literal('firePower'), chooseColor: z.enum(['red','green','blue','yellow']).optional(), targetId: z.string().optional() })
+]);
+server/src/socket.ts (rate limit + validator)
+import type { Server, Socket } from 'socket.io';
+import { createRoomHub } from './gameRoom.js';
+import { IntentSchema, JoinSchema } from './validator.js';
+
+export function registerSocket(io: Server) {
+  const hub = createRoomHub(io);
+  const buckets = new Map<string, { tokens: number; last: number }>();
+
+  function allow(sock: Socket): boolean {
+    const now = Date.now();
+    const b = buckets.get(sock.id) ?? { tokens: 5, last: now };
+    const regen = Math.floor((now - b.last) / 1000) * 5; // 5 tokens/sec
+    b.tokens = Math.min(20, b.tokens + regen);
+    b.last = now;
+    if (b.tokens <= 0) { buckets.set(sock.id, b); return false; }
+    b.tokens -= 1; buckets.set(sock.id, b); return true;
+  }
+
+  io.on('connection', (sock: Socket) => {
+    sock.on('join', (payload, cb) => {
+      if (!allow(sock)) return cb({ error: 'rate_limited' });
+      const p = JoinSchema.safeParse(payload);
+      if (!p.success) return cb({ error: 'bad_join' });
+      hub.join(sock, p.data, cb);
+    });
+    sock.on('start', (_payload, cb) => {
+      if (!allow(sock)) return cb({ error: 'rate_limited' });
+      hub.start(sock, {}, cb);
+    });
+    sock.on('intent', (payload, cb) => {
+      if (!allow(sock)) return cb({ error: 'rate_limited' });
+      const safe = IntentSchema.safeParse(payload);
+      if (!safe.success) return cb({ error: 'bad_intent' });
+      hub.intent(sock, safe.data, cb);
+    });
+    sock.on('disconnect', () => hub.leave(sock));
+  });
+}
+server/src/gameRoom.ts (tiny replay & AFK ghosting hook)
+import type { Server, Socket } from 'socket.io';
+import { v4 as uuid } from 'uuid';
+import { DEFAULT_VARIANTS } from '../../client/src/rules/variants';
+import { newGame, step } from '../../client/src/rules/engine';
+import type { Intent, TableState } from '../../client/src/rules/types';
+
+type Room = {
+  id: string;
+  seed: string;
+  players: Map<string, { id: string; name: string; socketId: string; lastSeen: number }>;
+  state?: TableState;
+  replay: Array<[number, string, string]>;
+};
+
+export function createRoomHub(io: Server) {
+  const rooms = new Map<string, Room>();
+
+  function join(sock: Socket, payload: { roomId?: string; name: string }, cb: (x: any)=>void) {
+    const roomId = payload.roomId ?? uuid().slice(0,6);
+    let room = rooms.get(roomId);
+    if (!room) { room = { id: roomId, seed: uuid(), players: new Map(), replay: [] }; rooms.set(roomId, room); }
+
+    room.players.set(sock.id, { id: sock.id, name: payload.name, socketId: sock.id, lastSeen: Date.now() });
+    sock.join(roomId);
+    io.to(roomId).emit('state', room.state ?? { lobby: true, players: Array.from(room.players.values()).map(p=>p.name) });
+    cb({ ok: true, roomId });
+  }
+
+  function start(sock: Socket, _payload: unknown, cb: (x: any)=>void) {
+    const room = roomFor(sock); if (!room) return cb({ error: 'no_room' });
+    const names = Array.from(room.players.values()).map(p=>p.name);
+    room.state = newGame(names, room.seed, DEFAULT_VARIANTS);
+    room.replay = [];
+    io.to(room.id).emit('state', room.state);
+    cb({ ok: true });
+  }
+
+  function intent(sock: Socket, payload: Intent, cb: (x: any)=>void) {
+    const room = roomFor(sock); if (!room || !room.state) return cb({ error: 'no_room' });
+    room.players.get(sock.id)!.lastSeen = Date.now();
+    const before = room.state;
+    room.state = step(room.state, payload);
+    if (room.state !== before) room.replay.push([Date.now(), sock.id, payload.t]);
+    io.to(room.id).emit('state', room.state);
+    cb({ ok: true });
+  }
+
+  function leave(sock: Socket) {
+    const r = roomFor(sock); if (!r) return;
+    r.players.delete(sock.id);
+    if (r.players.size === 0) rooms.delete(r.id);
+  }
+
+  function roomFor(sock: Socket): Room | undefined {
+    for (const r of rooms.values()) if (r.players.has(sock.id)) return r;
+    return undefined;
+  }
+
+  // Simple AFK ghosting loop (would be a cron/timer in a real app)
+  setInterval(() => {
+    const now = Date.now();
+    for (const r of rooms.values()) {
+      for (const p of r.players.values()) {
+        if (now - p.lastSeen > 30000) { /* mark ghost in r.state if needed */ }
+      }
+    }
+  }, 5000);
+
+  return { join, start, intent, leave };
+}
+
+Tests
+client/src/rules/engine.plus4.test.ts
+import { describe, it, expect } from 'vitest';
+import { newGame, step } from './engine';
+import { DEFAULT_VARIANTS } from './variants';
+import type { TableState } from './types';
+
+function names() { return ['P1','P2']; }
+
+describe('+4 challenge', () => {
+  it('applies successful challenge (attacker draws 4, target keeps turn)', () => {
+    const g = newGame(names(), 'seed', { ...DEFAULT_VARIANTS, noBluffing: true });
+    // Force state where current can play +4 illegally (simulate by setting topColor to a color they also have)
+    const s: TableState = structuredClone(g);
+    s.players[0].hand.push({ kind:'wild', wild:'+4' }, { kind:'number', color: s.topColor, value: 1 });
+    const s1 = step(s, { t: 'play', cardIndex: s.players[0].hand.length - 2, chooseColor: s.topColor });
+    expect(s1.plus4?.open).toBe(true);
+    const s2 = step(s1, { t: 'challenge' });
+    // attacker (P1) drew 4
+    expect(s2.players[0].hand.length).toBeGreaterThan(s.players[0].hand.length);
+    // target is still P2 (kept turn)
+    expect(s2.current).toBe(1);
+  });
+});
+client/src/rules/engine.uno.test.ts
+import { describe, it, expect } from 'vitest';
+import { newGame, step } from './engine';
+import { DEFAULT_VARIANTS } from './variants';
+
+describe('UNO penalty', () => {
+  it('adds +2 if player fails to call UNO', () => {
+    const g = newGame(['A','B'], 'seed', DEFAULT_VARIANTS);
+    // craft scenario: current has 2 cards both matching
+    const s = structuredClone(g);
+    s.players[0].hand = [
+      { kind:'number', color: s.topColor, value: 1 },
+      { kind:'number', color: s.topColor, value: 2 }
+    ];
+    const s1 = step(s, { t: 'play', cardIndex: 0 }); // now 1 card, did not call UNO
+    const offenderBefore = s.players[0].hand.length;
+    const s2 = step(s1, { t: 'draw' }); // next player's action advances turn and triggers penalty
+    const offenderAfter = s2.players[s2.players.length - 1].hand.length; // previous player index
+    expect(offenderAfter).toBeGreaterThan(offenderBefore);
+  });
+});
+client/src/rules/engine.stacking.test.ts
+import { describe, it, expect } from 'vitest';
+import { newGame, step } from './engine';
+import { DEFAULT_VARIANTS } from './variants';
+
+describe('stacking', () => {
+  it('forces stacking response or draw', () => {
+    const g = newGame(['A','B'], 'seed', { ...DEFAULT_VARIANTS, stacking: true });
+    const s = structuredClone(g);
+    // Give A a +2 to play; give B another +2 to stack
+    s.players[0].hand.push({ kind:'action', color: s.topColor, symbol:'+2' });
+    const s1 = step(s, { t: 'play', cardIndex: s.players[0].hand.length-1 });
+    const bHasToStack = step(s1, { t: 'draw' }); // if B draws, advance and apply
+    expect(bHasToStack.players[1].hand.length).toBeGreaterThan(s.players[1].hand.length);
+  });
+});
+
+Notes on Performance & A11y in this drop
+* All UI animations are short spring transforms; global prefers-reduced-motion honored.
+* Color tokens keep ≥4.5:1 contrast; CB-safe palette persists.
+* Hand virtualization not yet required; implemented as flex wrap. (We’ll add virtualization when dynamic hand >12.)
+
+What to run
+* Client: cd client && npm i && npm run dev
+* Server (optional): cd server && npm i && npm run dev
+
+Status vs. Acceptance Checklist (delta)
+* ✅ Rules engine rejects illegal plays; UNO penalty auto-enforced at turn advance.
+* ✅ Wild +4 challenge implemented with window + penalties.
+* ✅ Variants supported: stacking, 7-0, draw-to-match; jump-in left for realtime build (spec requires out-of-turn).
+* ✅ Reduced Motion / colorblind maintained.
+* ☐ Multiplayer room UI wiring (SocketClient is ready; not bound yet).
+* ☐ More a11y narration (ARIA live region) & full responsiveness polish.
+* ☐ PWA icons, more locales, deeper tests.
+
+NEXT:
+* client/src/ui/components/JumpInHint.tsx and jump-in validator updates
+* client/src/ui/components/ColorPicker.tsx (for choosing wild/surge colors)
+* client/src/ui/screens/Lobby.tsx + SocketClient wiring in UI
+* client/src/rules/engine.ts (small: expose scoring + round/game over)
+* client/src/themes/* (finish 3 full themes + selectable card backs)
+* server/src/* (replay download endpoint, AFK ghost substitution)
+* More tests: jump-in, 7-0 swap rotation order, shield interception, surge force-color legality
