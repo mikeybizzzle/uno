@@ -1,0 +1,313 @@
+Sweet — tying off the “spectate + docs + acceptance” thread you green-lit. This adds a proper **Spectate** entry in the menu, complete **ARCHITECTURE.md** and **API.md**, and a practical **Acceptance walkthrough** you (or QA) can run verbatim.
+
+---
+
+## 1) Menu → Spectate route (wire-in)
+
+### `client/src/ui/screens/Menu.tsx`
+
+```tsx
+export function MenuScreen({
+  onStart, onSettings, onMultiplayer, onTutorial, onSpectate
+}: {
+  onStart: ()=>void; onSettings: ()=>void; onMultiplayer: ()=>void; onTutorial: ()=>void; onSpectate: ()=>void;
+}) {
+  const startFlow = () => {
+    // ...unchanged (tutorial first-run gate)...
+    onStart();
+  };
+  return (
+    <div className="h-full grid place-items-center">
+      <div className="p-8 rounded-2xl bg-[var(--surface)] shadow-elev-3 text-center">
+        <h1 className="text-3xl font-extrabold mb-1">Chroma Clash</h1>
+        <p className="text-[var(--muted)] mb-6">Chain colors. Charge powers. Clash.</p>
+        <div className="flex gap-3 justify-center flex-wrap">
+          <button className="px-6 py-3 rounded-xl bg-[var(--blue)] text-white font-bold" onClick={startFlow}>Solo</button>
+          <button className="px-6 py-3 rounded-xl bg-white/10" onClick={onMultiplayer}>Multiplayer</button>
+          <button className="px-6 py-3 rounded-xl bg-white/10" onClick={onSettings}>Settings</button>
+          <button className="px-6 py-3 rounded-xl bg-white/10" onClick={onTutorial}>Tutorial</button>
+          <button className="px-6 py-3 rounded-xl bg-white/10" onClick={onSpectate}>Spectate</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+### `client/src/App.tsx`
+
+```tsx
+import { SpectateScreen } from './ui/screens/Spectate';
+import { TutorialScreen } from './ui/screens/Tutorial';
+
+type Route = 'menu'|'game'|'settings'|'lobby'|'results'|'tutorial'|'spectate';
+
+export default function App() {
+  // ...existing...
+  return (
+    <div className="h-full w-full">
+      {route === 'menu' && (
+        <MenuScreen
+          onStart={() => setRoute('game')}
+          onSettings={() => setRoute('settings')}
+          onMultiplayer={() => setRoute('lobby')}
+          onTutorial={() => setRoute('tutorial')}
+          onSpectate={() => setRoute('spectate')}
+        />
+      )}
+      {route === 'tutorial' && <TutorialScreen onDone={() => setRoute('game')} />}
+      {route === 'spectate' && <SpectateScreen onBack={() => setRoute('menu')} />}
+      {/* other routes unchanged */}
+    </div>
+  );
+}
+```
+
+---
+
+## 2) `docs/ARCHITECTURE.md`
+
+```md
+# Chroma Clash — Architecture
+
+## Overview
+- **Client**: Vite + React + TypeScript + Tailwind + Framer Motion + Zustand.
+- **Pure rules** in `client/src/rules/*` (framework-agnostic, deterministic).
+- **AI** in `client/src/ai/*` (heuristic with pluggable levels).
+- **Networking** (optional): Node + Fastify + Socket.IO (authoritative server).
+- **Persistence**: local settings (theme, cardback, tutorialSeen, resume token).
+- **PWA**: offline solo, installable, SVG icons.
+
+## State Machine
+```
+
+Lobby -> Dealing -> TurnStart -> (PrePlay) -> Resolve -> Draw -> EndTurn
+-> \[RoundEnd] -> (nextRound)
+-> \[GameOver]
+
+```
+**Events**: `play`, `draw`, `callUno`, `challenge`, `firePower`, `jumpIn`.
+
+### ASCII diagram
+```
+
+\[Lobby]
+\| start
+v
+\[Dealing] -> set hands, top card, firstColor
+v
+\[TurnStart] --(no time)--> \[PrePlay]
+\| (intent: play)   | (intent: draw)
+v                  v
+\[Resolve]           \[Draw] --(auto-play if match & drawToMatch)--> \[EndTurn]
+\| (+2/+4 effects, reverse, skip, surge/echo/shield)
+v
+\[EndTurn] --(apply UNO penalty, pending draw, skip; maybe +4 challenge)-->
+(if +4 challenge open) -> \[TurnStart(target)]
+else -> \[TurnStart(next)]
+(if someone out) -> \[RoundEnd] or \[GameOver]
+
+```
+
+## Type Model (abridged)
+See `client/src/rules/types.ts`:
+- `Card` (`number|action|wild`)
+- `TableState`: piles, players, direction, `topColor`, `topCard`, `pendingDraw`, `plus4`, `forceColor`, `scores`, `dealer`, `phase`, `variants`.
+- `Intent`: `play|draw|callUno|challenge|firePower|jumpIn`.
+
+## Module Boundaries
+- `rules/*`: pure, deterministic; no DOM or timers.
+- `state/store.ts`: thin Zustand store, `dispatch(intent)` routes to `rules.step`.
+- `ui/*`: presentational + small controllers; subscribes via selectors.
+- `ai/*`: stateless helpers calling `rules.step` to produce next state.
+- `net/*`: SocketClient and `bindRemote` for multiplayer.
+- `audio/*`: tiny WebAudio SFX.
+- `themes/*`: CSS variables & card backs.
+
+## Networking
+- **Authoritative server** validates `intent` (zod), steps the rules, and broadcasts `state`.
+- **Messages**:
+  - `join {name, roomId?, token?} -> {roomId, token}`
+  - `start {variants?} -> ok; emits state`
+  - `intent Intent -> ok; emits state`
+  - `state TableState` (server → clients)
+- **Rooms**: hub in memory; replay log `[timestamp, socketId, event]`.
+- **Reconnection**: client stores `{roomId, token}`; server maps token → player meta.
+- **Spectate**: any socket in room receives `state`; non-players simply never send turns.
+
+## Security & Fair Play
+- No client authority; server shuffles with seed; validates plays (+4 legality with `noBluffing`).
+- Rate limiting on socket events (token bucket).
+- AFK: `isGhost` flagged after idle; (future) auto-bot takeover.
+
+## Performance
+- 60fps goal: transform-only animations, tiny DOM, virtualization for 12+ cards, lazy assets, seeded RNG, O(1) hand ops.
+- Avoid heavy re-renders: localized selectors, minimal state writes.
+
+## Accessibility
+- High-contrast/colorblind themes, icon redundancy for color.
+- Screen-reader announcements (ARIA live).
+- Reduced Motion path.
+- Keyboardable UI (focus order, Esc to close modals).
+
+## Deterministic Replay
+- Given `{seed, replay[]}` and variants, rules can reconstruct the match.
+- (Future) export/import `.ccreplay` and time-scrub viewer.
+
+```
+
+---
+
+## 3) `docs/API.md`
+
+````md
+# Chroma Clash — Socket API
+
+Transport: **Socket.IO** (WebSocket). All callbacks are ACKs with `{ ok: true }` or `{ error: string }`.
+
+## Events
+
+### `join`
+Client → Server
+```json
+{ "name": "Alice", "roomId": "abcd12", "token": "optional-reconnect-token" }
+````
+
+Server → Client (ack)
+
+```json
+{ "ok": true, "roomId": "abcd12", "token": "generated-or-reused-token" }
+```
+
+Also emits `state` to room (either lobby meta or a full `TableState`).
+
+### `start`
+
+Client → Server
+
+```json
+{ "variants": {
+  "stacking": true, "jumpIn": true, "sevenZero": false,
+  "drawToMatch": false, "noBluffing": true, "scoring": true
+}}
+```
+
+Server ACK `{ ok: true }` and broadcasts first `state`.
+
+### `intent`
+
+Client → Server — one of:
+
+```ts
+{ t: 'play', cardIndex: number, chooseColor?: 'red'|'green'|'blue'|'yellow', targetId?: string }
+{ t: 'draw' }
+{ t: 'callUno' }
+{ t: 'challenge' }
+{ t: 'firePower', chooseColor?: 'red'|'green'|'blue'|'yellow', targetId?: string }
+{ t: 'jumpIn', playerIndex: number, cardIndex: number, chooseColor?: 'red'|'green'|'blue'|'yellow' }
+```
+
+Server ACK `{ ok: true }`, broadcasts new `state` (or rejects with `{ error: 'bad_intent' }`).
+
+### `state`
+
+Server → Clients — full `TableState` snapshot (authoritative).
+
+## HTTP
+
+* `GET /health` → `{ ok: true }`
+* `GET /replay/:roomId` → `{ id, seed, replay }` for deterministic replays.
+
+## Validation
+
+* All payloads zod-validated (`server/src/validator.ts`).
+* Rate-limited (token bucket \~5 events/s baseline, burst 20).
+
+````
+
+---
+
+## 4) Acceptance Checklist — walkthrough
+
+Below is how to verify each line item, with what you’ll **see**:
+
+1) **Rules engine rejects illegal plays & UNO penalties**  
+   - Start Solo → open DevTools → set state to have two playable cards of top color. Play one, **do not** press UNO.  
+   - After the next turn advance, your hand +2: penalty applied. (Unit: `engine.uno.test.ts`; E2E: `uno-penalty.spec.ts`.)
+
+2) **Wild +4 challenge works**  
+   - Craft a state where attacker has +4 **and** a card of the active color. Play +4, then as target, send `challenge`.  
+   - Attacker draws 4; target keeps turn. (Unit: `engine.plus4.test.ts`; E2E: `plus4-challenge.spec.ts`.)
+
+3) **Variants togglable at room creation**  
+   - Lobby → switch toggles (e.g., enable Jump-In & 7-0). Start Remote.  
+   - Jump-In becomes available; play a `0` and see hand rotation. (Unit tests: `engine.jumpin.test.ts`, `engine.sevenzero.test.ts`.)
+
+4) **Smooth 60fps dealing/play anims**  
+   - Light hardware: open Performance panel; play a few cards. CPU timeline remains under 16ms frames, transforms only.
+
+5) **Colorblind mode & WCAG**  
+   - Settings → Theme: **CB**. Icons on cards indicate symbols; text on solid hues hits ≥4.5:1.
+
+6) **Reduced Motion**  
+   - OS Reduced Motion on → app suppresses nonessential animations (short springs only). No parallax/flares.
+
+7) **Responsive layouts**  
+   - Test iPhone SE width (375px) to ultrawide. Hand wraps; timer & UNO reachable; left/right safe zones respected. For >12 cards, virtualization kicks in (scrollable rail).
+
+8) **Offline solo**  
+   - Build or run dev → kill network → Solo still works (rules/AI local). PWA installable (`manifest.webmanifest` + SW).
+
+9) **Multiplayer rooms**  
+   - Server on → two clients join same room → **Start Remote**.  
+   - Make one client refresh; it can **Resume** by token. AFK >45s marks `(AFK)` next to player.
+
+10) **Clean TypeScript & tests green**  
+   - `npm run typecheck`, `npm run lint`.  
+   - `npm run test` (Vitest) + `npm run e2e` (Playwright) pass.
+
+11) **PWA installs; SW updates**  
+   - `Add to Home Screen` available; versioned service worker swaps on next load without breaking state.
+
+12) **All code blocks compile & run**  
+   - Fresh clone: `npm i && npm run dev` in both `client` and `server` succeeds.
+
+---
+
+### Practical commands
+
+Client:
+```bash
+cd client
+npm i
+npm run dev         # http://localhost:5173
+npm run test        # Vitest
+npm run e2e         # Playwright (keep dev server running)
+````
+
+Server:
+
+```bash
+cd server
+npm i
+npm run dev         # ws/http on :8787
+```
+
+---
+
+## 5) Notes & tiny deltas you might want next
+
+* Real spectator join (server flag for sockets not in `players`), mute UI.
+* Server persistence (Redis) for rooms/replays beyond process lifetime.
+* Results UI: richer score breakdown (per card value tally).
+* Bot “hard” mode with lookahead (simulate 1–2 plies).
+
+---
+
+**NEXT:**
+
+* `CONTRIBUTING.md` (branching, code style, commit hooks)
+* `docs/ARCHITECTURE.md` (add seed/replay proof & cheat-resistance details)
+* `docs/API.md` (spectator role & REST seed endpoints)
+* `client/src/ui/screens/Results.tsx` (per-card score breakdown)
+* `server/src/gameRoom.ts` (spectator sockets, room cap & evict policy)
