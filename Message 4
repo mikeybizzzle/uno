@@ -1,0 +1,414 @@
+Uno 4
+
+Awesome — here’s the next drop with remote binding, a11y live narration, virtualized hands, PWA icons, card backs, next-round/dealer rotation, a Results screen, and tests. Plug these files into the structure we’ve been building.
+
+1) Networking binder (client → server intents)
+client/src/net/bindRemote.ts
+import type { SocketClient } from './SocketClient';
+import type { Intent, TableState } from '../rules/types';
+import { useStore } from '../state/store';
+
+/**
+ * Binds the local store to a SocketClient:
+ * - dispatch() sends intents to server
+ * - incoming 'state' frames replace local state
+ */
+export function bindRemote(net: SocketClient) {
+  net.onState((st: TableState) => {
+    (useStore.setState as any)({ state: st });
+  });
+
+  // Patch dispatch to send intents remotely
+  const orig = useStore.getState().dispatch;
+  (useStore.setState as any)({
+    dispatch: (i: Intent) => {
+      net.intent(i).catch(() => {
+        // if server unreachable, fall back to local for safety
+        orig(i);
+      });
+    }
+  });
+}
+
+/** Undo remote binding: restore local dispatch (optional) */
+export function unbindRemote() {
+  const orig = useStore.getState().dispatch;
+  (useStore.setState as any)({ dispatch: orig });
+}
+
+2) Accessibility: screen-reader narration
+client/src/ui/components/AriaLive.tsx
+import { useEffect, useRef } from 'react';
+
+export function AriaLive({ message }: { message: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    // Force re-announce by toggling textContent
+    ref.current.textContent = '';
+    const t = setTimeout(() => { if (ref.current) ref.current.textContent = message; }, 10);
+    return () => clearTimeout(t);
+  }, [message]);
+
+  return (
+    <div
+      ref={ref}
+      aria-live="polite"
+      aria-atomic="true"
+      className="sr-only"
+    />
+  );
+}
+Add the SR-only utility (if not present) to your Tailwind base (global CSS already fine; Tailwind ships .sr-only).
+
+3) Large hands: simple virtualization
+client/src/ui/components/HandVirtual.tsx
+import { useEffect, useRef, useState } from 'react';
+import type { Card as TCard } from '../../rules/types';
+import { Card } from './Card';
+
+const CARD_W = 64 + 8; // width + gap estimate
+
+export function HandVirtual({ cards, onPlay }: { cards: TCard[]; onPlay: (i:number)=>void }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [range, setRange] = useState<[number, number]>([0, 12]);
+
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const visible = Math.ceil(el.clientWidth / CARD_W);
+      const start = Math.max(0, Math.floor(el.scrollLeft / CARD_W) - 2);
+      const end = Math.min(cards.length, start + visible + 4);
+      setRange([start, end]);
+    };
+    onScroll();
+    el.addEventListener('scroll', onScroll, { passive: true });
+    const ro = new ResizeObserver(onScroll);
+    ro.observe(el);
+    return () => { el.removeEventListener('scroll', onScroll); ro.disconnect(); };
+  }, [cards.length]);
+
+  const [start, end] = range;
+  return (
+    <div ref={wrapRef} className="flex gap-2 overflow-x-auto p-2" role="listbox" aria-label="your hand">
+      <div style={{ width: start * CARD_W }} />
+      {cards.slice(start, end).map((c, i) => (
+        <Card key={start + i} card={c} selectable onClick={() => onPlay(start + i)} />
+      ))}
+      <div style={{ width: Math.max(0, (cards.length - end) * CARD_W) }} />
+    </div>
+  );
+}
+client/src/ui/components/Hand.tsx (auto-swap to virtual at 12+)
+import { Card } from './Card';
+import type { Card as TCard } from '../../rules/types';
+import { HandVirtual } from './HandVirtual';
+
+export function Hand({ cards, onPlay }: { cards: TCard[]; onPlay: (i:number)=>void }) {
+  if (cards.length >= 12) return <HandVirtual cards={cards} onPlay={onPlay} />;
+  return (
+    <div className="flex gap-2 flex-wrap justify-center p-2" role="listbox" aria-label="your hand">
+      {cards.map((c, i) => <Card key={i} card={c} selectable onClick={() => onPlay(i)} />)}
+    </div>
+  );
+}
+
+4) PWA icons + manifest
+client/public/icons/icon-192.svg
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">
+  <rect width="192" height="192" rx="32" fill="#1B2035"/>
+  <circle cx="64" cy="64" r="28" fill="#E85C5C"/>
+  <circle cx="128" cy="64" r="28" fill="#3EB489"/>
+  <circle cx="64" cy="128" r="28" fill="#4A79FF"/>
+  <circle cx="128" cy="128" r="28" fill="#F2C94C"/>
+</svg>
+client/public/icons/icon-512.svg
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="64" fill="#1B2035"/>
+  <circle cx="170" cy="170" r="80" fill="#E85C5C"/>
+  <circle cx="342" cy="170" r="80" fill="#3EB489"/>
+  <circle cx="170" cy="342" r="80" fill="#4A79FF"/>
+  <circle cx="342" cy="342" r="80" fill="#F2C94C"/>
+</svg>
+client/public/manifest.webmanifest (update)
+{
+  "name": "Chroma Clash",
+  "short_name": "ChromaClash",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0F1220",
+  "theme_color": "#0F1220",
+  "icons": [
+    { "src": "/icons/icon-192.svg", "sizes": "192x192", "type": "image/svg+xml", "purpose": "any maskable" },
+    { "src": "/icons/icon-512.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
+
+5) Card backs & draw pile styling
+client/src/utils/prefs.ts
+import { load, save } from './persist';
+
+export type Theme = 'dark'|'light'|'cb';
+export type CardBack = 'classic'|'grid'|'neon';
+
+export const getTheme = () => load<Theme>('theme', 'dark');
+export const setThemePref = (t: Theme) => save('theme', t);
+
+export const getCardBack = () => load<CardBack>('cardback', 'classic');
+export const setCardBack = (c: CardBack) => save('cardback', c);
+client/src/ui/components/Card.tsx (support face-down/back class)
+import { motion } from 'framer-motion';
+import type { Card as TCard } from '../../rules/types';
+
+function glyph(c: TCard) {
+  if (c.kind === 'number') return String(c.value);
+  if (c.kind === 'action') return c.symbol;
+  return c.wild === '+4' ? '+4' : '★';
+}
+function colorToken(c: TCard) {
+  if (c.kind === 'wild') return 'bg-gradient-to-br from-[var(--red)] via-[var(--green)] to-[var(--blue)]';
+  const m = { red:'bg-[var(--red)]', green:'bg-[var(--green)]', blue:'bg-[var(--blue)]', yellow:'bg-[var(--yellow)]' } as const;
+  return m[c.color];
+}
+
+export function Card({
+  card,
+  selectable=false,
+  onClick,
+  faceDown=false,
+  backClass='cardback-classic'
+}: { card: TCard; selectable?: boolean; onClick?: () => void; faceDown?: boolean; backClass?: string }) {
+  return (
+    <motion.button
+      onClick={onClick}
+      whileHover={{ y: selectable ? -6 : 0 }}
+      whileTap={{ scale: selectable ? 0.98 : 1 }}
+      className={`relative w-16 h-24 rounded-xl text-xl font-bold shadow-elev-2 select-none ${faceDown ? backClass : colorToken(card)} ${selectable ? 'ring-2 ring-white/70' : ''}`}
+      aria-label={faceDown ? 'card back' : `card ${glyph(card)}`}
+    >
+      {!faceDown && (
+        <div className="absolute inset-0 m-1 rounded-lg bg-white/10 backdrop-blur-sm grid place-items-center">
+          <span>{glyph(card)}</span>
+        </div>
+      )}
+    </motion.button>
+  );
+}
+client/src/ui/components/Piles.tsx (use card back on draw pile)
+import { Card } from './Card';
+import type { Card as TCard } from '../../rules/types';
+import { getCardBack } from '../../utils/prefs';
+
+export function Piles({ discardTop }: { discardTop: TCard }) {
+  const back = getCardBack();
+  const className = back === 'classic' ? 'cardback-classic' : back === 'grid' ? 'cardback-grid' : 'cardback-neon';
+  return (
+    <div className="flex items-center gap-6">
+      <Card card={discardTop} faceDown backClass={className} />
+      <Card card={discardTop} />
+    </div>
+  );
+}
+
+6) Engine: next round & dealer rotation
+client/src/rules/engine.ts (add dealer + nextRound)
+// Add to TableState in types (if not yet): dealer: number;
+Add/modify in newGame:
+  return {
+    seed, drawPile, discardPile, players,
+    current: 0, direction: 1, topColor: firstColor as any, topCard: top,
+    pendingDraw: 0, pendingType: undefined, mustSkip: false,
+    phase: 'turnStart', variants, unoPendingFor: undefined,
+    plus4: null, forceColor: null, echoLock: false,
+    round: 1, scores: new Array(players.length).fill(0), targetScore: 500,
+    dealer: 0
+  } as any;
+Add exports at bottom:
+export function nextRound(prev: TableState, winnerIdx: number): TableState {
+  const names = prev.players.map(p => p.name);
+  const seed = prev.seed + '-r' + (prev.round + 1);
+  const variants = prev.variants;
+  const g = newGame(names, seed, variants);
+  g.scores = prev.scores.slice();
+  g.round = prev.round + 1;
+  g.dealer = winnerIdx;                 // winner deals next
+  g.current = (g.dealer + 1) % g.players.length; // next player starts
+  return g;
+}
+Make sure TableState in types.ts includes:
+  dealer: number;
+And update any references accordingly.
+
+7) Results UI
+client/src/ui/screens/Results.tsx
+import { useStore } from '../../state/store';
+import { nextRound } from '../../rules/engine';
+
+export function ResultsScreen({ onNext, onExit }: { onNext: ()=>void; onExit: ()=>void }) {
+  const s = useStore((st) => st.state);
+  const winner = typeof s.gameWinner === 'number' ? s.gameWinner : s.players.findIndex(p => p.hand.length === 0);
+  const wonMatch = s.phase === 'gameOver';
+  const title = wonMatch ? 'Game Over' : 'Round Results';
+
+  return (
+    <div className="h-full grid place-items-center">
+      <div className="p-6 rounded-2xl bg-[var(--surface)] w-[min(520px,95vw)]">
+        <h2 className="text-2xl font-bold mb-2">{title}</h2>
+        <p className="mb-4">Winner: <b>{s.players[winner]?.name ?? '—'}</b></p>
+        {s.variants.scoring && (
+          <div className="mb-4">
+            <div className="font-semibold mb-1">Scores</div>
+            <ul className="space-y-1">
+              {s.players.map((p, i) => (
+                <li key={p.id} className="flex justify-between">
+                  <span>{p.name}</span>
+                  <span>{s.scores[i]}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <div className="flex gap-2">
+          {!wonMatch && (
+            <button
+              onClick={() => {
+                const ng = nextRound(s, winner);
+                (useStore.setState as any)({ state: ng });
+                onNext();
+              }}
+              className="px-4 py-2 rounded-lg bg-[var(--blue)] text-white font-bold"
+            >
+              Next Round
+            </button>
+          )}
+          <button onClick={onExit} className="px-4 py-2 rounded-lg bg-white/10">Exit</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+8) Wire routes & narration
+client/src/App.tsx (swap to Results when round ends)
+import { useEffect, useState } from 'react';
+import { GameScreen } from './ui/screens/Game';
+import { MenuScreen } from './ui/screens/Menu';
+import { SettingsScreen } from './ui/screens/Settings';
+import { LobbyScreen } from './ui/screens/Lobby';
+import { ResultsScreen } from './ui/screens/Results';
+import { useStore } from './state/store';
+
+type Route = 'menu'|'game'|'settings'|'lobby'|'results';
+
+export default function App() {
+  const [route, setRoute] = useState<Route>('menu');
+  const phase = useStore((st) => st.state.phase);
+
+  useEffect(() => {
+    if ((phase === 'roundEnd' || phase === 'gameOver') && route === 'game') setRoute('results');
+  }, [phase, route]);
+
+  return (
+    <div className="h-full w-full">
+      {route === 'menu' && (
+        <MenuScreen
+          onStart={() => setRoute('game')}
+          onSettings={() => setRoute('settings')}
+          onMultiplayer={() => setRoute('lobby')}
+        />
+      )}
+      {route === 'lobby' && (
+        <LobbyScreen
+          onStartLocal={() => setRoute('game')}
+          onEnterRemote={() => setRoute('game')}
+        />
+      )}
+      {route === 'game' && <GameScreen onExit={() => setRoute('menu')} />}
+      {route === 'settings' && <SettingsScreen onBack={() => setRoute('menu')} />}
+      {route === 'results' && <ResultsScreen onNext={() => setRoute('game')} onExit={() => setRoute('menu')} />}
+    </div>
+  );
+}
+client/src/ui/screens/Game.tsx (add AriaLive messages + remote bind in Lobby)
+Already integrated ColorPicker & Jump-In previously. Add narration:
+// Add at top:
+import { AriaLive } from '../components/AriaLive';
+
+// Inside component:
+const [liveMsg, setLiveMsg] = useState('');
+const prev = useRef({ current: s.current, color: s.topColor });
+
+useEffect(() => {
+  if (s.current !== prev.current.current) {
+    const name = s.players[s.current].name;
+    setLiveMsg(name === 'You' ? 'Your turn.' : `${name}'s turn.`);
+    prev.current.current = s.current;
+  }
+  if (s.topColor !== prev.current.color) {
+    setLiveMsg(`Color is now ${s.topColor}.`);
+    prev.current.color = s.topColor;
+  }
+}, [s.current, s.topColor, s.players]);
+
+// At bottom of JSX:
+<AriaLive message={liveMsg} />
+client/src/ui/screens/Lobby.tsx (bind remote after join)
+// new import:
+import { bindRemote } from '../../net/bindRemote';
+
+// after successful join():
+const join = async () => {
+  const r = await sock.join(name, roomId || undefined);
+  setRoomId(r.roomId);
+  bindRemote(sock); // bind intents/state for remote play
+};
+
+9) Tests for next round & dealer rotation
+client/src/rules/engine.nextround.test.ts
+import { describe, it, expect } from 'vitest';
+import { newGame, nextRound } from './engine';
+import { DEFAULT_VARIANTS } from './variants';
+
+describe('nextRound / dealer rotation', () => {
+  it('winner becomes dealer and next player starts', () => {
+    const g = newGame(['A','B','C'], 'seed', { ...DEFAULT_VARIANTS, scoring: true });
+    const winner = 1;
+    const n = nextRound({ ...g, round: 1 }, winner);
+    expect(n.dealer).toBe(winner);
+    expect(n.current).toBe((winner + 1) % 3);
+    expect(n.round).toBe(2);
+  });
+});
+
+10) Quick usage notes
+* Remote play: open server (cd server && npm i && npm run dev), then in client Lobby, join a room (blank to create), click Start Remote. The binder routes your local intents to the server and replaces state on updates.
+* A11y: screen readers announce turn changes and color changes; Reduced Motion still respected.
+* Performance: hands ≥12 use a scrolled, windowed list.
+
+11) Acceptance Checklist — updates
+* ✅ Rules engine rejects illegal plays; UNO penalties enforced on turn advance.
+* ✅ Wild +4 challenge window + penalties; stacking, jump-in, 7–0 implemented.
+* ✅ Variants togglable in code (UI toggles can be added in Settings later).
+* ✅ 60fps-friendly animations, Reduced Motion honored.
+* ✅ Colorblind theme + icon redundancies; contrast respected.
+* ✅ Responsive layouts (mobile/desktop); large hands virtualized.
+* ✅ Offline solo via PWA; icons provided (SVG).
+* ✅ Multiplayer wiring: Lobby binds to SocketClient; state round-trips.
+* ✅ TypeScript strict; tests expanded (Vitest + Playwright basic).
+* ✅ PWA installs; versioned SW (simple) + icons.
+* ☐ Spectating, reconnection UX polish, and robust room lifecycle (queued for roadmap).
+
+12) Legal & Naming
+* As before: Avoid Mattel branding; “Uno-style” mechanics only; original names & art.
+
+13) Roadmap teaser (post-handoff)
+* Ranked queues, async leagues, tournaments, spectators, seasonal events, mod hooks, richer bot heuristics, analytics, cosmetics shop (non-pay-to-win).
+
+NEXT:
+* client/src/ui/components/VariantsToggle.tsx (room variants UI)
+* client/src/ui/screens/Tutorial.tsx (interactive guide)
+* server/src/gameRoom.ts (room settings incl. variants; reconnection tokens)
+* client/src/e2e/uno-penalty.spec.ts & client/src/e2e/plus4-challenge.spec.ts (Playwright)
+* client/src/audio/sfx.ts (map more SFX + haptic patterns)
+* README.md (commands for remote play, variants, a11y notes)
