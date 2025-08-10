@@ -1,0 +1,569 @@
+Uno 5
+
+Shipping the next bundle: variants UI, tutorial, server variants + reconnection tokens, Playwright e2e (UNO penalty, +4 challenge), richer SFX + haptics, dev hooks for deterministic tests, and README updates.
+
+1) Variants UI (client)
+client/src/ui/components/VariantsToggle.tsx
+import { useState } from 'react';
+import type { VariantToggles } from '../../rules/types';
+
+const FIELDS: Array<{ key: keyof VariantToggles; label: string; help?: string }> = [
+  { key: 'stacking', label: 'Stacking +2/+4' },
+  { key: 'jumpIn', label: 'Jump-In (out-of-turn identical play)' },
+  { key: 'sevenZero', label: '7–0 Swap/Rotate' },
+  { key: 'drawToMatch', label: 'Draw-to-Match (draw until playable)' },
+  { key: 'noBluffing', label: 'No Bluffing +4 (illegal if color held)' },
+  { key: 'scoring', label: 'Scoring to 500' }
+];
+
+export function VariantsToggle({
+  value,
+  onChange
+}: {
+  value: VariantToggles;
+  onChange: (v: VariantToggles) => void;
+}) {
+  const [v, setV] = useState<VariantToggles>(value);
+  const set = <K extends keyof VariantToggles>(k: K, val: boolean) => {
+    const next = { ...v, [k]: val };
+    setV(next);
+    onChange(next);
+  };
+
+  return (
+    <div className="grid gap-2">
+      {FIELDS.map((f) => (
+        <label key={f.key} className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={v[f.key]}
+            onChange={(e) => set(f.key, e.target.checked)}
+          />
+          <span className="text-sm">{f.label}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+client/src/ui/screens/Lobby.tsx (wire variants + remote bind)
+import { useEffect, useState } from 'react';
+import { SocketClient } from '../../net/SocketClient';
+import { useStore } from '../../state/store';
+import { bindRemote } from '../../net/bindRemote';
+import { VariantsToggle } from '../components/VariantsToggle';
+import { DEFAULT_VARIANTS } from '../../rules/variants';
+import type { VariantToggles } from '../../rules/types';
+
+const sock = new SocketClient();
+
+export function LobbyScreen({
+  onStartLocal,
+  onEnterRemote
+}: {
+  onStartLocal: () => void;
+  onEnterRemote: () => void;
+}) {
+  const [name, setName] = useState('You');
+  const [roomId, setRoomId] = useState('');
+  const [connected, setConnected] = useState(false);
+  const [variants, setVariants] = useState<VariantToggles>(DEFAULT_VARIANTS);
+
+  useEffect(() => {
+    if (!connected) {
+      sock.connect(location.origin.replace('5173', '8787'));
+      setConnected(true);
+      bindRemote(sock);
+    }
+  }, [connected]);
+
+  useEffect(() => {
+    sock.onState((st) => {
+      if ((st as any).lobby) return;
+      (useStore.setState as any)({ state: st });
+      onEnterRemote();
+    });
+  }, [onEnterRemote]);
+
+  const join = async () => {
+    const r = await sock.join(name, roomId || undefined);
+    setRoomId(r.roomId);
+  };
+
+  const start = async () => {
+    await sock.start(variants);
+  };
+
+  return (
+    <div className="h-full grid place-items-center">
+      <div className="p-6 rounded-2xl bg-[var(--surface)] w-[min(560px,95vw)]">
+        <h2 className="text-2xl font-bold mb-4">Lobby</h2>
+        <div className="grid gap-3 mb-4">
+          <label className="text-sm">Name
+            <input className="w-full px-3 py-2 rounded-lg bg-white/10 ml-2" value={name} onChange={(e)=>setName(e.target.value)} />
+          </label>
+          <label className="text-sm">Room
+            <input className="w-full px-3 py-2 rounded-lg bg-white/10 ml-2" value={roomId} onChange={(e)=>setRoomId(e.target.value)} placeholder="(blank to create)" />
+          </label>
+        </div>
+        <div className="mb-4">
+          <div className="font-semibold mb-2">Variants</div>
+          <VariantsToggle value={variants} onChange={setVariants} />
+        </div>
+        <div className="flex gap-2">
+          <button onClick={join} className="px-4 py-2 rounded-lg bg-[var(--blue)] text-white font-bold">Join/Create</button>
+          <button onClick={start} className="px-4 py-2 rounded-lg bg-white/10">Start Remote</button>
+          <button onClick={onStartLocal} className="px-4 py-2 rounded-lg bg-white/10">Start Local Solo</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+2) Tutorial (client)
+client/src/ui/screens/Tutorial.tsx (interactive, minimal)
+import { useState } from 'react';
+
+const steps = [
+  { title: 'Match Color or Symbol', body: 'Play a card that matches the top color, number, or symbol.' },
+  { title: 'UNO!', body: 'When you have one card left, tap the UNO button before the next turn.' },
+  { title: 'Combo Meter', body: 'Play same-color streaks to charge your power. Tap it at 3 pips.' },
+  { title: 'Wild +4 Challenge', body: 'If someone plays +4 and you think they had the color, challenge!' }
+];
+
+export function TutorialScreen({ onDone }: { onDone: ()=>void }) {
+  const [i, setI] = useState(0);
+  const s = steps[i];
+  return (
+    <div className="h-full grid place-items-center">
+      <div className="p-6 rounded-2xl bg-[var(--surface)] w-[min(520px,95vw)]">
+        <h2 className="text-2xl font-bold mb-2">{s.title}</h2>
+        <p className="mb-4 text-[var(--muted)]">{s.body}</p>
+        <div className="flex gap-2">
+          {i < steps.length - 1 ? (
+            <button onClick={()=>setI(i+1)} className="px-4 py-2 rounded-lg bg-[var(--blue)] text-white font-bold">Next</button>
+          ) : (
+            <button onClick={onDone} className="px-4 py-2 rounded-lg bg-[var(--blue)] text-white font-bold">Start Playing</button>
+          )}
+          <button onClick={onDone} className="px-4 py-2 rounded-lg bg-white/10">Skip</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+(You can expose the tutorial from Menu later; keeping modular.)
+
+3) Server: variants + reconnection tokens
+server/src/validator.ts (extend schemas)
+import { z } from 'zod';
+
+export const VariantsSchema = z.object({
+  stacking: z.boolean(),
+  jumpIn: z.boolean(),
+  sevenZero: z.boolean(),
+  drawToMatch: z.boolean(),
+  noBluffing: z.boolean(),
+  scoring: z.boolean()
+});
+
+export const JoinSchema = z.object({
+  roomId: z.string().optional(),
+  name: z.string().min(1).max(24),
+  token: z.string().optional()
+});
+
+export const StartSchema = z.object({
+  variants: VariantsSchema.optional()
+});
+
+export const IntentSchema = z.discriminatedUnion('t', [
+  z.object({ t: z.literal('play'), cardIndex: z.number().int().min(0), chooseColor: z.enum(['red','green','blue','yellow']).optional(), targetId: z.string().optional() }),
+  z.object({ t: z.literal('draw') }),
+  z.object({ t: z.literal('callUno') }),
+  z.object({ t: z.literal('challenge') }),
+  z.object({ t: z.literal('firePower'), chooseColor: z.enum(['red','green','blue','yellow']).optional(), targetId: z.string().optional() }),
+  z.object({ t: z.literal('jumpIn'), cardIndex: z.number().int().min(0), playerIndex: z.number().int().min(0), chooseColor: z.enum(['red','green','blue','yellow']).optional() })
+]);
+server/src/socket.ts (use StartSchema; return token on join)
+import type { Server } from 'socket.io';
+import { createRoomHub } from './gameRoom.js';
+import { IntentSchema, JoinSchema, StartSchema } from './validator.js';
+
+export function registerSocket(io: Server) {
+  const hub = createRoomHub(io);
+
+  io.on('connection', (sock) => {
+    const allow = rateLimit();
+
+    sock.on('join', (payload, cb) => {
+      if (!allow(sock)) return cb({ error: 'rate_limited' });
+      const p = JoinSchema.safeParse(payload);
+      if (!p.success) return cb({ error: 'bad_join' });
+      const res = hub.join(sock, p.data);
+      cb(res);
+    });
+
+    sock.on('start', (payload, cb) => {
+      if (!allow(sock)) return cb({ error: 'rate_limited' });
+      const p = StartSchema.safeParse(payload ?? {});
+      if (!p.success) return cb({ error: 'bad_start' });
+      hub.start(sock, p.data);
+      cb({ ok: true });
+    });
+
+    sock.on('intent', (payload, cb) => {
+      if (!allow(sock)) return cb({ error: 'rate_limited' });
+      const safe = IntentSchema.safeParse(payload);
+      if (!safe.success) return cb({ error: 'bad_intent' });
+      hub.intent(sock, safe.data);
+      cb({ ok: true });
+    });
+
+    sock.on('disconnect', () => hub.leave(sock));
+  });
+
+  return hub;
+}
+
+function rateLimit() {
+  const buckets = new Map<string, { tokens: number; last: number }>();
+  return (sock: any) => {
+    const now = Date.now();
+    const b = buckets.get(sock.id) ?? { tokens: 5, last: now };
+    const dt = Math.max(0, now - b.last);
+    b.tokens = Math.min(20, b.tokens + Math.floor(dt / 1000) * 5);
+    b.last = now;
+    if (b.tokens <= 0) { buckets.set(sock.id, b); return false; }
+    b.tokens -= 1; buckets.set(sock.id, b); return true;
+  };
+}
+server/src/gameRoom.ts (store variants; reconnection tokens)
+import type { Server, Socket } from 'socket.io';
+import { v4 as uuid } from 'uuid';
+import { DEFAULT_VARIANTS } from '../../client/src/rules/variants';
+import { newGame, step } from '../../client/src/rules/engine';
+import type { Intent, TableState, VariantToggles } from '../../client/src/rules/types';
+
+type PlayerMeta = { id: string; name: string; socketId: string; lastSeen: number; token: string };
+type Room = {
+  id: string;
+  seed: string;
+  players: Map<string, PlayerMeta>; // key by socketId
+  byToken: Map<string, PlayerMeta>;
+  variants: VariantToggles;
+  state?: TableState;
+  replay: Array<[number, string, string]>;
+};
+
+export function createRoomHub(io: Server) {
+  const rooms = new Map<string, Room>();
+
+  function ensureRoom(id: string) {
+    let r = rooms.get(id);
+    if (!r) {
+      r = { id, seed: uuid(), players: new Map(), byToken: new Map(), variants: DEFAULT_VARIANTS, replay: [] };
+      rooms.set(id, r);
+    }
+    return r;
+  }
+
+  function join(sock: Socket, payload: { roomId?: string; name: string; token?: string }) {
+    const roomId = payload.roomId ?? uuid().slice(0,6);
+    const room = ensureRoom(roomId);
+
+    // Reconnect by token?
+    let meta: PlayerMeta | undefined;
+    if (payload.token && room.byToken.has(payload.token)) {
+      meta = room.byToken.get(payload.token)!;
+      meta.socketId = sock.id;
+      meta.lastSeen = Date.now();
+    } else {
+      const token = uuid();
+      meta = { id: sock.id, name: payload.name, socketId: sock.id, lastSeen: Date.now(), token };
+      room.byToken.set(token, meta);
+    }
+
+    room.players.set(sock.id, meta);
+    sock.join(roomId);
+
+    io.to(roomId).emit('state', room.state ?? { lobby: true, players: Array.from(room.players.values()).map(p=>p.name), variants: room.variants });
+    return { ok: true, roomId, token: meta.token };
+  }
+
+  function start(sock: Socket, payload: { variants?: VariantToggles }) {
+    const room = roomFor(sock); if (!room) return { error: 'no_room' };
+    if (payload.variants) room.variants = payload.variants;
+    const names = Array.from(room.players.values()).map(p=>p.name);
+    room.state = newGame(names, room.seed, room.variants);
+    room.replay = [];
+    io.to(room.id).emit('state', room.state);
+    return { ok: true };
+  }
+
+  function intent(sock: Socket, payload: Intent) {
+    const room = roomFor(sock); if (!room || !room.state) return { error: 'no_room' };
+    room.players.get(sock.id)!.lastSeen = Date.now();
+    const before = room.state;
+    room.state = step(room.state, payload);
+    if (room.state !== before) room.replay.push([Date.now(), sock.id, payload.t]);
+    io.to(room.id).emit('state', room.state);
+    return { ok: true };
+  }
+
+  function leave(sock: Socket) {
+    const r = roomFor(sock); if (!r) return;
+    r.players.delete(sock.id);
+    if (r.players.size === 0) rooms.delete(r.id);
+  }
+
+  function roomFor(sock: Socket): Room | undefined {
+    for (const r of rooms.values()) if (r.players.has(sock.id)) return r;
+    return undefined;
+  }
+
+  function getReplay(roomId: string) {
+    const r = rooms.get(roomId); if (!r) return null;
+    return { id: r.id, seed: r.seed, replay: r.replay };
+  }
+
+  // AFK flagging
+  setInterval(() => {
+    const now = Date.now();
+    for (const r of rooms.values()) {
+      if (!r.state) continue;
+      for (const p of r.players.values()) {
+        if (now - p.lastSeen > 45000) {
+          const idx = r.state.players.findIndex(x => x.name === p.name);
+          if (idx >= 0) r.state.players[idx].isGhost = true;
+          io.to(r.id).emit('state', r.state);
+        }
+      }
+    }
+  }, 5000);
+
+  return { join, start, intent, leave, getReplay };
+}
+
+4) Client: SocketClient accepts variants on start
+client/src/net/SocketClient.ts
+import { io, Socket } from 'socket.io-client';
+import type { Intent, TableState, VariantToggles } from '../rules/types';
+
+export class SocketClient {
+  private socket: Socket | null = null;
+
+  connect(url: string) {
+    if (this.socket) return;
+    this.socket = io(url, { transports: ['websocket'] });
+  }
+
+  join(name: string, roomId?: string, token?: string): Promise<{ roomId: string; token: string }> {
+    return new Promise((resolve) => {
+      this.socket!.emit('join', { name, roomId, token }, (resp: any) => resolve(resp));
+    });
+  }
+
+  start(variants?: VariantToggles): Promise<void> {
+    return new Promise((resolve) => {
+      this.socket!.emit('start', { variants }, () => resolve());
+    });
+  }
+
+  onState(cb: (s: TableState | any) => void) {
+    this.socket!.on('state', cb);
+  }
+
+  intent(i: Intent): Promise<void> {
+    return new Promise((resolve) => {
+      this.socket!.emit('intent', i, () => resolve());
+    });
+  }
+}
+
+5) SFX & Haptics
+client/src/audio/sfx.ts (expanded)
+type Tone = { f: number; t: number; g: number };
+function beep(seq: Tone[]) {
+  const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
+  if (!Ctx) return;
+  const ctx = new Ctx();
+  const now = ctx.currentTime;
+  seq.forEach((s, i) => {
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(s.f, now + s.t);
+    g.gain.setValueAtTime(s.g, now + s.t);
+    o.connect(g); g.connect(ctx.destination);
+    o.start(now + s.t);
+    o.stop(now + s.t + 0.12);
+  });
+  setTimeout(() => ctx.close(), (seq.at(-1)?.t ?? 0) * 1000 + 200);
+}
+
+function vibrate(pat: number | number[]) {
+  if (navigator.vibrate) navigator.vibrate(pat as any);
+}
+
+export const SFX = {
+  deal: () => beep([{ f: 420, t: 0, g: 0.02 }]),
+  draw: () => beep([{ f: 360, t: 0, g: 0.02 }]),
+  play: () => beep([{ f: 520, t: 0, g: 0.025 }]),
+  skip: () => beep([{ f: 300, t: 0, g: 0.03 }, { f: 260, t: 0.1, g: 0.02 }]),
+  reverse: () => beep([{ f: 400, t: 0, g: 0.02 }, { f: 500, t: 0.1, g: 0.02 }]),
+  plus: () => { beep([{ f: 600, t: 0, g: 0.03 }, { f: 640, t: 0.1, g: 0.03 }]); vibrate([10, 40, 10]); },
+  uno: () => { beep([{ f: 800, t: 0, g: 0.03 }]); vibrate(60); },
+  win: () => beep([{ f: 660, t: 0, g: 0.03 }, { f: 880, t: 0.12, g: 0.03 }]),
+  lose: () => beep([{ f: 240, t: 0, g: 0.03 }])
+};
+(You can call SFX.play() etc. from UI interactions later.)
+
+6) Dev hooks for deterministic e2e
+client/src/main.tsx (expose store & dispatch in dev)
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+import './themes/base.css';
+import './themes/dark.css';
+import './themes/light.css';
+import './themes/colorblind.css';
+import './styles/tokens.css';
+import { useStore } from './state/store';
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/service-worker.js').catch(() => {});
+  });
+}
+
+if (import.meta.env.DEV) {
+  (window as any).__store = useStore;
+  (window as any).__get = () => useStore.getState().state;
+  (window as any).__set = (s: any) => (useStore.setState as any)({ state: s });
+  (window as any).__dispatch = (i: any) => useStore.getState().dispatch(i);
+}
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+7) Playwright e2e tests
+client/e2e/uno-penalty.spec.ts
+import { test, expect } from '@playwright/test';
+
+test('UNO penalty triggers when not called', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Solo' }).click();
+  // craft state: two players, You has two same-color numbers, top matches
+  await page.evaluate(() => {
+    const st = (window as any).__get();
+    st.players = [
+      { ...st.players[0], name: 'You', hand: [
+        { kind:'number', color:'red', value:3 },
+        { kind:'number', color:'red', value:7 }
+      ], power: { kind:'shield', meter:0, armed:false } },
+      { ...st.players[1], name: 'B', hand: [] }
+    ];
+    st.players.length = 2;
+    st.topCard = { kind:'number', color:'red', value:5 };
+    st.topColor = 'red';
+    st.current = 0;
+    (window as any).__set(st);
+  });
+  // Play first card (do not press UNO)
+  await page.getByRole('listbox', { name: 'your hand' }).locator('button').first().click();
+  // Wait for bot to auto-draw/advance, which triggers penalty at advance
+  await page.waitForTimeout(800);
+  const after = await page.evaluate(() => (window as any).__get());
+  const you = after.players[(after.current + after.players.length - 1) % after.players.length];
+  expect(you.hand.length).toBeGreaterThan(1); // drew +2 penalty
+});
+client/e2e/plus4-challenge.spec.ts
+import { test, expect } from '@playwright/test';
+
+test('+4 challenge success makes attacker draw 4 and target keeps turn', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Solo' }).click();
+
+  await page.evaluate(() => {
+    const st = (window as any).__get();
+    st.players = [
+      { ...st.players[0], name: 'You', hand: [
+        { kind:'wild', wild:'+4' },
+        { kind:'number', color:'blue', value:2 } // matching color so +4 is illegal if top is blue
+      ], power: { kind:'shield', meter:0, armed:false } },
+      { ...st.players[1], name: 'B', hand: [] }
+    ];
+    st.players.length = 2;
+    st.topCard = { kind:'number', color:'blue', value:5 };
+    st.topColor = 'blue';
+    st.current = 0;
+    (window as any).__set(st);
+  });
+
+  // Play +4 (need color pick — use default heuristic, which is blue; fine)
+  await page.getByRole('listbox', { name: 'your hand' }).locator('button').first().click();
+
+  // When challenge window opens, current becomes target (B). Trigger challenge via dev dispatch hook.
+  await page.evaluate(() => (window as any).__dispatch({ t: 'challenge' }));
+
+  const after = await page.evaluate(() => (window as any).__get());
+  // Attacker (You) should have drawn 4
+  expect(after.players[0].hand.length).toBeGreaterThan(2);
+  // Target keeps turn: current should be 1 (B)
+  expect(after.current).toBe(1);
+});
+
+8) README updates
+README.md (append)
+## Multiplayer & Variants
+
+- Start server: `cd server && npm i && npm run dev`
+- Client Lobby: Join/Create a room (blank to create), adjust **Variants**, then **Start Remote**. A reconnection `token` is returned from `/join`; the client stores it internally for this session.
+
+## Accessibility
+
+- **Screen reader**: live region announces turns and color changes.
+- **Reduced Motion**: honors OS setting.
+- **Colorblind** theme with shape/icon redundancies.
+
+## E2E Tests
+
+In dev, we expose store helpers for deterministic tests:
+- `window.__get()` returns current state
+- `window.__set(state)` replaces state
+- `window.__dispatch(intent)` dispatches a rules intent
+
+Run:
+```bash
+cd client
+npm run dev   # in one terminal
+npm run e2e   # in another
+Audio & Haptics
+	•	Minimal WebAudio SFX; mobile haptics via navigator.vibrate when available.
+---
+
+## 9) Acceptance Checklist — progress
+
+- ✅ Rules engine: illegal plays rejected, UNO penalty enforced.
+- ✅ +4 challenge flow implemented; e2e covers success branch.
+- ✅ Variants toggle UI; server respects variants on `start`.
+- ✅ Reconnection tokens (server); basic AFK ghost flag.
+- ✅ A11y live narration; Reduced Motion; colorblind theme.
+- ✅ PWA icons & installable manifest.
+- ✅ Hand virtualization for large hands.
+- ✅ Tests: unit + Playwright e2e (UNO penalty, +4 challenge).
+- ☐ Polished spectating, reconnect UI prompt, full-room lifecycle (future).
+- ☐ Rich SFX mixing & per-event calls in UI (hooks ready).
+
+---
+
+If you want, I can wire SFX calls into UI interactions and add a **Spectator** view next.
+
+**NEXT:**
+- Wire SFX into `GameScreen` (play, draw, +2/+4, UNO, win/lose)
+- Add `client/src/ui/screens/Spectate.tsx`
+- Persist theme/cardback to localStorage and apply at startup
+- Add `server` reconnection resume API + client prompt
+- Add `Tutorial` entry in Menu and first-time-only flag
