@@ -1,0 +1,835 @@
+Uno 3
+
+Rolling in the next chunk: jump-in play, wild color picker, lobby + sockets, round scoring & game over, theme + card backs selection, replay endpoint, AFK ghost hook, and targeted tests. All files drop into the structure from before.
+
+1) Rules & Types — updates
+client/src/rules/types.ts (add scoring, jump-in intent)
+export type Color = 'red' | 'green' | 'blue' | 'yellow' | 'wild';
+export type SymbolCard = 'skip' | 'reverse' | '+2';
+export type WildCard = 'wild' | '+4';
+export type NumberCard = 0|1|2|3|4|5|6|7|8|9;
+
+export type Card =
+  | { kind: 'number'; color: Exclude<Color,'wild'>; value: NumberCard }
+  | { kind: 'action'; color: Exclude<Color,'wild'>; symbol: SymbolCard }
+  | { kind: 'wild'; wild: WildCard };
+
+export const isColorCard = (c: Card): c is Exclude<Card,{kind:'wild'}> => c.kind !== 'wild';
+
+export type PowerKind = 'shield'|'surge'|'siphon'|'echo';
+export interface PowerState { kind: PowerKind; meter: 0|1|2|3; armed: boolean; }
+
+export interface Player {
+  id: string; name: string; hand: Card[];
+  power: PowerState; isGhost?: boolean; unoArmed?: boolean;
+}
+
+export interface VariantToggles {
+  stacking: boolean; jumpIn: boolean; sevenZero: boolean;
+  drawToMatch: boolean; noBluffing: boolean; scoring: boolean;
+}
+
+export interface Plus4Window {
+  attacker: number;
+  target: number;
+  wasLegal: boolean;
+  open: boolean;
+}
+
+export interface ForceColor {
+  color: Exclude<Color,'wild'>;
+  turns: number;
+}
+
+export interface TableState {
+  seed: string;
+  drawPile: Card[]; discardPile: Card[];
+  players: Player[]; current: number; direction: 1|-1;
+  topColor: Exclude<Color,'wild'>; topCard: Card;
+  pendingDraw: number; pendingType?: '+2' | '+4';
+  mustSkip: boolean;
+  phase: 'lobby'|'dealing'|'turnStart'|'prePlay'|'resolve'|'draw'|'endTurn'|'roundEnd'|'gameOver';
+  variants: VariantToggles;
+  turnEndsAt?: number;
+
+  // UNO & challenge & twist
+  unoPendingFor?: number;
+  plus4?: Plus4Window | null;
+  forceColor?: ForceColor | null;
+  echoLock?: boolean;
+
+  // Scoring
+  round: number;
+  scores: number[];        // match scores per player
+  targetScore: number;     // e.g., 500
+  gameWinner?: number;     // index
+}
+
+export type Intent =
+  | { t: 'play'; cardIndex: number; chooseColor?: Exclude<Color,'wild'>; targetId?: string }
+  | { t: 'draw' }
+  | { t: 'callUno' }
+  | { t: 'challenge' }
+  | { t: 'firePower'; chooseColor?: Exclude<Color,'wild'>; targetId?: string }
+  | { t: 'jumpIn'; cardIndex: number; playerIndex: number; chooseColor?: Exclude<Color,'wild'> }
+  ;
+client/src/rules/engine.ts (add jump-in, scoring, game over)
+import { Card, Color, Intent, Player, TableState, VariantToggles } from './types';
+import { mulberry32, seedToInt } from '../utils/rng';
+
+/* ... existing makeDeck/shuffle ... */
+
+export function newGame(playerNames: string[], seed: string, variants: VariantToggles): TableState {
+  const deck = shuffle(makeDeck(), seed);
+  const players: Player[] = playerNames.map((n, i) => ({
+    id: String(i+1),
+    name: n,
+    hand: [],
+    power: { kind: 'shield', meter: 0, armed: false }
+  }));
+  const drawPile = deck.slice();
+  const discardPile: Card[] = [];
+
+  for (let r=0;r<7;r++) for (const p of players) p.hand.push(drawPile.pop()!);
+  let top: Card = drawPile.pop()!;
+  while (top.kind === 'wild' && top.wild === '+4') { drawPile.unshift(top); top = drawPile.pop()!; }
+  discardPile.push(top);
+  const firstColor = top.kind === 'wild' ? 'red' : top.color;
+
+  return {
+    seed, drawPile, discardPile, players,
+    current: 0, direction: 1, topColor: firstColor as any, topCard: top,
+    pendingDraw: 0, pendingType: undefined, mustSkip: false,
+    phase: 'turnStart', variants, unoPendingFor: undefined,
+    plus4: null, forceColor: null, echoLock: false,
+    round: 1, scores: new Array(players.length).fill(0), targetScore: 500
+  };
+}
+
+/* ... existing legalMoves, isMatch ... */
+
+export function step(s: TableState, intent: Intent): TableState {
+  const next = structuredClone(s) as TableState;
+  const me = next.players[next.current];
+
+  if (next.phase === 'gameOver') return s;
+
+  if (next.phase === 'turnStart') {
+    const p = next.players[next.current];
+    if (p.power.meter > 0) p.power.meter = (p.power.meter - 1) as any;
+  }
+
+  if (intent.t === 'callUno') {
+    me.unoArmed = true; next.unoPendingFor = undefined; return next;
+  }
+
+  if (intent.t === 'challenge') { /* ... unchanged from previous drop ... */ }
+
+  if (intent.t === 'firePower') { /* ... unchanged from previous drop ... */ }
+
+  if (intent.t === 'jumpIn') {
+    if (!next.variants.jumpIn) return s;
+    const i = intent.playerIndex;
+    if (i === next.current) return s;
+    const p = next.players[i];
+    const c = p.hand[intent.cardIndex];
+    if (!c) return s;
+    if (!isIdentical(c, next.topCard)) return s;
+
+    // play out of order
+    p.hand.splice(intent.cardIndex, 1);
+    next.discardPile.push(c);
+    next.topCard = c;
+    if (c.kind === 'wild') next.topColor = intent.chooseColor ?? pickColorHeuristic(p);
+    else next.topColor = c.color;
+
+    // resolve effects like a normal play (skip/reverse/+2/+4 etc.)
+    if (c.kind === 'action') {
+      if (c.symbol === 'skip') next.mustSkip = true;
+      if (c.symbol === 'reverse') next.direction = (next.direction * -1) as 1|-1;
+      if (c.symbol === '+2') { next.pendingDraw += 2; next.pendingType = '+2'; }
+    }
+    if (c.kind === 'wild' && c.wild === '+4') {
+      const activeColorAtTurn = next.topColor;
+      const hadMatch = p.hand.some((cc) => cc.kind !== 'wild' && cc.color === activeColorAtTurn);
+      const target = jumpInNextIndex(next, i); // victim is the player after jumper
+      next.pendingDraw += 4; next.pendingType = '+4';
+      next.plus4 = { attacker: i, target, wasLegal: !hadMatch, open: true };
+    }
+
+    // UNO for jumper
+    if (p.hand.length === 1 && !p.unoArmed) next.unoPendingFor = i;
+
+    // turn continues from jumper
+    next.current = i;
+    next.phase = 'endTurn';
+    advance(next);
+    return next;
+  }
+
+  if (intent.t === 'draw') { /* ... unchanged (with +4 window) ... */ }
+
+  if (intent.t === 'play') { /* ... unchanged from previous drop ... */ }
+
+  return s;
+}
+
+/* ------------ helpers (additions) ------------ */
+
+function isIdentical(a: Card, b: Card): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === 'number' && b.kind === 'number') return a.color === b.color && a.value === b.value;
+  if (a.kind === 'action' && b.kind === 'action') return a.color === b.color && a.symbol === b.symbol;
+  if (a.kind === 'wild' && b.kind === 'wild') return a.wild === b.wild; // allow wild jump-in by same wild type
+  return false;
+}
+
+function jumpInNextIndex(s: TableState, jumper: number) {
+  const n = s.players.length;
+  return (jumper + s.direction + n) % n;
+}
+
+/* ... existing drawOne/drawCards/nextIndex ... */
+
+function advance(s: TableState) {
+  // UNO penalty
+  if (typeof s.unoPendingFor === 'number') {
+    drawCards(s, s.unoPendingFor, 2);
+    s.unoPendingFor = undefined;
+  }
+
+  // +4 challenge window (unchanged)
+  if (s.plus4 && s.plus4.open) {
+    s.current = s.plus4.target;
+    s.phase = 'turnStart';
+    return;
+  }
+
+  let steps = 1;
+  if (s.mustSkip) { steps++; s.mustSkip = false; }
+  if (s.pendingDraw > 0) {
+    const ni = nextIndex(s);
+    const target = s.players[ni];
+    if (target.power.kind === 'shield' && target.power.armed) {
+      target.power.armed = false;
+      s.pendingDraw = 0; s.pendingType = undefined;
+    } else {
+      drawCards(s, ni, s.pendingDraw);
+      s.pendingDraw = 0; s.pendingType = undefined;
+      steps++;
+    }
+  }
+
+  for (let i=0;i<steps;i++) s.current = nextIndex(s);
+  s.phase = 'turnStart';
+
+  // Round end
+  const out = s.players.findIndex(p => p.hand.length === 0);
+  if (out !== -1) {
+    const gained = s.variants.scoring ? scoreRound(s, out) : 0;
+    if (s.variants.scoring) s.scores[out] += gained;
+    const reached = s.variants.scoring ? s.scores[out] >= s.targetScore : true;
+    if (reached) {
+      s.phase = 'gameOver';
+      s.gameWinner = out;
+      return;
+    } else {
+      s.phase = 'roundEnd';
+      // A real app would trigger next-round setup; omitted here.
+      return;
+    }
+  }
+}
+
+function scoreRound(s: TableState, winnerIdx: number): number {
+  let total = 0;
+  for (let i = 0; i < s.players.length; i++) {
+    if (i === winnerIdx) continue;
+    for (const c of s.players[i].hand) {
+      if (c.kind === 'number') total += c.value;
+      else if (c.kind === 'action') total += 20;
+      else total += 50;
+    }
+  }
+  return total;
+}
+
+/* ... other helpers unchanged ... */
+
+2) UI — jump-in hint, color picker, lobby + sockets, settings updates
+client/src/ui/components/JumpInHint.tsx
+export function JumpInHint({ onJump }: { onJump: ()=>void }) {
+  return (
+    <button
+      onClick={onJump}
+      className="fixed bottom-28 right-3 px-4 py-2 rounded-xl bg-[var(--blue)] text-white font-bold shadow-elev-3"
+      aria-label="Jump in!"
+      title="Jump in"
+    >
+      Jump-In
+    </button>
+  );
+}
+client/src/ui/components/ColorPicker.tsx
+import { useEffect } from 'react';
+
+const colors: Array<{ key: 'red'|'green'|'blue'|'yellow'; token: string }> = [
+  { key: 'red', token: 'var(--red)' },
+  { key: 'green', token: 'var(--green)' },
+  { key: 'blue', token: 'var(--blue)' },
+  { key: 'yellow', token: 'var(--yellow)' }
+];
+
+export function ColorPicker({ onPick, onClose }: { onPick: (c:'red'|'green'|'blue'|'yellow')=>void; onClose: ()=>void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div className="fixed inset-0 bg-black/40 grid place-items-center">
+      <div className="p-4 rounded-2xl bg-[var(--surface)] shadow-elev-3">
+        <div className="text-sm mb-3">Choose a color</div>
+        <div className="flex gap-3">
+          {colors.map(c => (
+            <button key={c.key}
+              onClick={()=>onPick(c.key)}
+              className="w-10 h-10 rounded-full"
+              style={{ background: c.token }}
+              aria-label={`Choose ${c.key}`}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+client/src/ui/screens/Lobby.tsx
+import { useEffect, useRef, useState } from 'react';
+import { SocketClient } from '../../net/SocketClient';
+import { useStore } from '../../state/store';
+
+const sock = new SocketClient();
+
+export function LobbyScreen({ onStartLocal, onEnterRemote }: { onStartLocal: ()=>void; onEnterRemote: ()=>void }) {
+  const [name, setName] = useState('You');
+  const [roomId, setRoomId] = useState('');
+  const [connected, setConnected] = useState(false);
+
+  useEffect(() => {
+    if (!connected) { sock.connect(location.origin.replace('5173','8787')); setConnected(true); }
+  }, [connected]);
+
+  useEffect(() => {
+    sock.onState((st) => {
+      if ((st as any).lobby) return; // waiting room
+      // Remote state arrives: replace local store
+      (useStore.setState as any)({ state: st });
+      onEnterRemote();
+    });
+  }, [onEnterRemote]);
+
+  const join = async () => {
+    const r = await sock.join(name, roomId || undefined);
+    setRoomId(r.roomId);
+  };
+
+  const start = async () => { await sock.start(); };
+
+  return (
+    <div className="h-full grid place-items-center">
+      <div className="p-6 rounded-2xl bg-[var(--surface)] w-[min(520px,95vw)]">
+        <h2 className="text-2xl font-bold mb-4">Lobby</h2>
+        <div className="grid gap-3">
+          <label className="text-sm">Name
+            <input className="w-full px-3 py-2 rounded-lg bg-white/10 ml-2" value={name} onChange={(e)=>setName(e.target.value)} />
+          </label>
+          <label className="text-sm">Room
+            <input className="w-full px-3 py-2 rounded-lg bg-white/10 ml-2" value={roomId} onChange={(e)=>setRoomId(e.target.value)} placeholder="(blank to create)" />
+          </label>
+          <div className="flex gap-2">
+            <button onClick={join} className="px-4 py-2 rounded-lg bg-[var(--blue)] text-white font-bold">Join/Create</button>
+            <button onClick={start} className="px-4 py-2 rounded-lg bg-white/10">Start Remote</button>
+            <button onClick={onStartLocal} className="px-4 py-2 rounded-lg bg-white/10">Start Local Solo</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+client/src/themes/index.ts
+export type Theme = 'dark'|'light'|'cb';
+export function setTheme(t: Theme) {
+  const root = document.documentElement;
+  root.classList.remove('dark','light','cb');
+  root.classList.add(t);
+}
+client/src/ui/screens/Settings.tsx (theme & card back)
+import { setTheme } from '../../themes';
+import { useState } from 'react';
+import '../../themes/cardbacks.css';
+
+export function SettingsScreen({ onBack }: { onBack: ()=>void }) {
+  const [theme, setThemeState] = useState<'dark'|'light'|'cb'>('dark');
+  const [cardback, setCardback] = useState<'classic'|'grid'|'neon'>('classic');
+
+  const applyTheme = (t: 'dark'|'light'|'cb') => { setThemeState(t); setTheme(t); };
+
+  return (
+    <div className="h-full p-6">
+      <h2 className="text-2xl font-bold mb-4">Settings</h2>
+
+      <div className="mb-6">
+        <div className="font-semibold mb-2">Theme</div>
+        <div className="flex gap-2">
+          {(['dark','light','cb'] as const).map(t=>
+            <button key={t} onClick={()=>applyTheme(t)}
+              className={`px-3 py-2 rounded-lg ${theme===t?'bg-[var(--blue)] text-white':'bg-white/10'}`}>
+              {t.toUpperCase()}
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="mb-6">
+        <div className="font-semibold mb-2">Card back</div>
+        <div className="flex gap-3 items-center">
+          <div onClick={()=>setCardback('classic')} className={`w-10 h-16 cardback-classic cursor-pointer ${cardback==='classic'?'ring-2 ring-[var(--yellow)]':''}`} />
+          <div onClick={()=>setCardback('grid')} className={`w-10 h-16 cardback-grid cursor-pointer ${cardback==='grid'?'ring-2 ring-[var(--yellow)]':''}`} />
+          <div onClick={()=>setCardback('neon')} className={`w-10 h-16 cardback-neon cursor-pointer ${cardback==='neon'?'ring-2 ring-[var(--yellow)]':''}`} />
+        </div>
+      </div>
+
+      <button onClick={onBack} className="mt-6 px-4 py-2 rounded-lg bg-white/10">Back</button>
+    </div>
+  );
+}
+client/src/ui/screens/Menu.tsx (route to Lobby)
+export function MenuScreen({ onStart, onSettings, onMultiplayer }: { onStart: ()=>void; onSettings: ()=>void; onMultiplayer: ()=>void }) {
+  return (
+    <div className="h-full grid place-items-center">
+      <div className="p-8 rounded-2xl bg-[var(--surface)] shadow-elev-3 text-center">
+        <h1 className="text-3xl font-extrabold mb-1">Chroma Clash</h1>
+        <p className="text-[var(--muted)] mb-6">Chain colors. Charge powers. Clash.</p>
+        <div className="flex gap-3 justify-center">
+          <button className="px-6 py-3 rounded-xl bg-[var(--blue)] text-white font-bold" onClick={onStart}>Solo</button>
+          <button className="px-6 py-3 rounded-xl bg-white/10" onClick={onMultiplayer}>Multiplayer</button>
+          <button className="px-6 py-3 rounded-xl bg-white/10" onClick={onSettings}>Settings</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+client/src/App.tsx (add Lobby route)
+import { useState } from 'react';
+import { GameScreen } from './ui/screens/Game';
+import { MenuScreen } from './ui/screens/Menu';
+import { SettingsScreen } from './ui/screens/Settings';
+import { LobbyScreen } from './ui/screens/Lobby';
+
+type Route = 'menu'|'game'|'settings'|'lobby';
+
+export default function App() {
+  const [route, setRoute] = useState<Route>('menu');
+
+  return (
+    <div className="h-full w-full">
+      {route === 'menu' && (
+        <MenuScreen
+          onStart={() => setRoute('game')}
+          onSettings={() => setRoute('settings')}
+          onMultiplayer={() => setRoute('lobby')}
+        />
+      )}
+      {route === 'lobby' && (
+        <LobbyScreen
+          onStartLocal={() => setRoute('game')}
+          onEnterRemote={() => setRoute('game')}
+        />
+      )}
+      {route === 'game' && <GameScreen onExit={() => setRoute('menu')} />}
+      {route === 'settings' && <SettingsScreen onBack={() => setRoute('menu')} />}
+    </div>
+  );
+}
+client/src/ui/screens/Game.tsx (wire ColorPicker + Jump-In)
+import { useEffect, useRef, useState } from 'react';
+import { useStore } from '../../state/store';
+import { Hand } from '../components/Hand';
+import { Piles } from '../components/Piles';
+import { TurnBanner } from '../components/TurnBanner';
+import { Timer } from '../components/Timer';
+import { HUD } from '../components/HUD';
+import { PowerCard } from '../components/PowerCard';
+import { Toast } from '../components/Toast';
+import { botMove } from '../../ai/bot';
+import { ColorPicker } from '../components/ColorPicker';
+import { JumpInHint } from '../components/JumpInHint';
+import type { Card as TCard } from '../../rules/types';
+
+export function GameScreen({ onExit }: { onExit: ()=>void }) {
+  const s = useStore((st) => st.state);
+  const dispatch = useStore((st) => st.dispatch);
+  const me = s.players[s.current];
+  const youIdx = s.players.findIndex(p => p.name === 'You');
+  const [toast, setToast] = useState<string | null>(null);
+  const [wildIdx, setWildIdx] = useState<number | null>(null);
+  const [surgeReady, setSurgeReady] = useState(false);
+
+  // bots play
+  const ticking = useRef(false);
+  useEffect(() => {
+    if (me.name !== 'You' && !ticking.current) {
+      ticking.current = true;
+      const t = setTimeout(() => {
+        const after = botMove(s, 'normal');
+        (useStore.setState as any)({ state: after });
+        ticking.current = false;
+      }, 500);
+      return () => clearTimeout(t);
+    }
+  }, [s, me.name]);
+
+  const onExpire = () => { if (me.name === 'You') dispatch({ t: 'draw' }); };
+
+  // Jump-in detection for You
+  const canJump = s.variants.jumpIn && s.players[s.current].name !== 'You' && hasIdenticalCardToTop(s.topCard, s.players[youIdx]?.hand || []);
+
+  return (
+    <div className="h-full flex flex-col">
+      <TurnBanner name={me.name} />
+      <Timer seconds={20} onExpire={onExpire} />
+
+      <div className="p-3 flex items-center justify-between">
+        <div>Top color: <b className="capitalize">{s.topColor}</b></div>
+        <PowerCard power={me.power} onFire={() => {
+          if (me.power.kind === 'surge' && me.power.meter >= 3) setSurgeReady(true);
+          else dispatch({ t: 'firePower' });
+        }} />
+      </div>
+
+      <div className="flex-1 grid place-items-center">
+        <Piles discardTop={s.topCard} />
+      </div>
+
+      <div className="border-t border-white/10">
+        {me.name === 'You' ? (
+          <Hand
+            cards={me.hand}
+            onPlay={(i) => {
+              const c = me.hand[i] as TCard | undefined;
+              if (!c) return;
+              if (c.kind === 'wild') { setWildIdx(i); return; }
+              dispatch({ t: 'play', cardIndex: i });
+              const afterState = useStore.getState().state;
+              const prevIdx = (afterState.current + afterState.players.length - 1) % afterState.players.length;
+              if (afterState.players[prevIdx].name === 'You' && afterState.players[prevIdx].hand.length === 1) setToast('Say UNO!');
+            }}
+          />
+        ) : (
+          <div className="p-6 text-center text-[var(--muted)]">Bots are thinking…</div>
+        )}
+      </div>
+
+      <HUD onExit={onExit} onDraw={() => dispatch({ t: 'draw' })} onUno={() => dispatch({ t: 'callUno' })} />
+      <Toast text={toast ?? ''} show={!!toast} onDone={() => setToast(null)} />
+
+      {canJump && (
+        <JumpInHint onJump={() => {
+          // find an identical card index in your hand
+          const idx = (s.players[youIdx].hand || []).findIndex(c => isIdentical(c, s.topCard));
+          const c = s.players[youIdx].hand[idx];
+          if (c?.kind === 'wild') setWildIdx(idx); // need color
+          else dispatch({ t: 'jumpIn', playerIndex: youIdx, cardIndex: idx });
+        }} />
+      )}
+
+      {wildIdx !== null && (
+        <ColorPicker
+          onPick={(color) => {
+            const isJump = s.players[s.current].name !== 'You'; // jump-in context if not your turn
+            if (isJump) dispatch({ t: 'jumpIn', playerIndex: youIdx, cardIndex: wildIdx, chooseColor: color });
+            else dispatch({ t: 'play', cardIndex: wildIdx, chooseColor: color });
+            setWildIdx(null);
+          }}
+          onClose={() => setWildIdx(null)}
+        />
+      )}
+
+      {surgeReady && (
+        <ColorPicker
+          onPick={(color) => { dispatch({ t: 'firePower', chooseColor: color }); setSurgeReady(false); }}
+          onClose={() => setSurgeReady(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function isIdentical(a: TCard, b: TCard): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === 'number' && b.kind === 'number') return a.color === b.color && a.value === b.value;
+  if (a.kind === 'action' && b.kind === 'action') return a.color === b.color && a.symbol === b.symbol;
+  if (a.kind === 'wild' && b.kind === 'wild') return a.wild === b.wild;
+  return false;
+}
+function hasIdenticalCardToTop(top: TCard, hand: TCard[]) {
+  return hand.some(c => isIdentical(c, top));
+}
+
+3) Server — replay endpoint & export hub
+server/src/socket.ts (return hub)
+import type { Server } from 'socket.io';
+import { createRoomHub } from './gameRoom.js';
+import { IntentSchema, JoinSchema } from './validator.js';
+
+export function registerSocket(io: Server) {
+  const hub = createRoomHub(io);
+
+  io.on('connection', (sock) => {
+    const allow = rateLimit();
+    sock.on('join', (payload, cb) => { if (!allow(sock)) return cb({ error: 'rate_limited' });
+      const p = JoinSchema.safeParse(payload); if (!p.success) return cb({ error: 'bad_join' });
+      hub.join(sock, p.data, cb);
+    });
+    sock.on('start', (_payload, cb) => { if (!allow(sock)) return cb({ error: 'rate_limited' }); hub.start(sock, {}, cb); });
+    sock.on('intent', (payload, cb) => { if (!allow(sock)) return cb({ error: 'rate_limited' });
+      const safe = IntentSchema.safeParse(payload); if (!safe.success) return cb({ error: 'bad_intent' });
+      hub.intent(sock, safe.data, cb);
+    });
+    sock.on('disconnect', () => hub.leave(sock));
+  });
+
+  return hub;
+}
+
+function rateLimit() {
+  const buckets = new Map<string, { tokens: number; last: number }>();
+  return (sock: any) => {
+    const now = Date.now();
+    const b = buckets.get(sock.id) ?? { tokens: 5, last: now };
+    const dt = Math.max(0, now - b.last);
+    b.tokens = Math.min(20, b.tokens + Math.floor(dt / 1000) * 5);
+    b.last = now;
+    if (b.tokens <= 0) { buckets.set(sock.id, b); return false; }
+    b.tokens -= 1; buckets.set(sock.id, b); return true;
+  };
+}
+server/src/gameRoom.ts (expose replay getter; mark AFK ghosts)
+import type { Server, Socket } from 'socket.io';
+import { v4 as uuid } from 'uuid';
+import { DEFAULT_VARIANTS } from '../../client/src/rules/variants';
+import { newGame, step } from '../../client/src/rules/engine';
+import type { Intent, TableState } from '../../client/src/rules/types';
+
+type Room = {
+  id: string;
+  seed: string;
+  players: Map<string, { id: string; name: string; socketId: string; lastSeen: number }>;
+  state?: TableState;
+  replay: Array<[number, string, string]>;
+};
+
+export function createRoomHub(io: Server) {
+  const rooms = new Map<string, Room>();
+
+  function join(sock: Socket, payload: { roomId?: string; name: string }, cb: (x: any)=>void) {
+    const roomId = payload.roomId ?? uuid().slice(0,6);
+    let room = rooms.get(roomId);
+    if (!room) { room = { id: roomId, seed: uuid(), players: new Map(), replay: [] }; rooms.set(roomId, room); }
+    room.players.set(sock.id, { id: sock.id, name: payload.name, socketId: sock.id, lastSeen: Date.now() });
+    sock.join(roomId);
+    io.to(roomId).emit('state', room.state ?? { lobby: true, players: Array.from(room.players.values()).map(p=>p.name) });
+    cb({ ok: true, roomId });
+  }
+
+  function start(sock: Socket, _payload: unknown, cb: (x: any)=>void) {
+    const room = roomFor(sock); if (!room) return cb({ error: 'no_room' });
+    const names = Array.from(room.players.values()).map(p=>p.name);
+    room.state = newGame(names, room.seed, DEFAULT_VARIANTS);
+    room.replay = [];
+    io.to(room.id).emit('state', room.state);
+    cb({ ok: true });
+  }
+
+  function intent(sock: Socket, payload: Intent, cb: (x: any)=>void) {
+    const room = roomFor(sock); if (!room || !room.state) return cb({ error: 'no_room' });
+    room.players.get(sock.id)!.lastSeen = Date.now();
+    const before = room.state;
+    room.state = step(room.state, payload);
+    if (room.state !== before) room.replay.push([Date.now(), sock.id, payload.t]);
+    io.to(room.id).emit('state', room.state);
+    cb({ ok: true });
+  }
+
+  function leave(sock: Socket) {
+    const r = roomFor(sock); if (!r) return;
+    r.players.delete(sock.id);
+    if (r.players.size === 0) rooms.delete(r.id);
+  }
+
+  function roomFor(sock: Socket): Room | undefined {
+    for (const r of rooms.values()) if (r.players.has(sock.id)) return r;
+    return undefined;
+  }
+
+  function getReplay(roomId: string) {
+    const r = rooms.get(roomId); if (!r) return null;
+    return { id: r.id, seed: r.seed, replay: r.replay };
+  }
+
+  // AFK ghost: mark player as ghost in state after 45s idle
+  setInterval(() => {
+    const now = Date.now();
+    for (const r of rooms.values()) {
+      if (!r.state) continue;
+      const names = Array.from(r.players.values());
+      names.forEach((p, idx) => {
+        if (now - p.lastSeen > 45000) {
+          const pi = idx; if (r.state!.players[pi]) r.state!.players[pi].isGhost = true;
+          io.to(r.id).emit('state', r.state);
+        }
+      });
+    }
+  }, 5000);
+
+  return { join, start, intent, leave, getReplay };
+}
+server/src/index.ts (replay download route)
+import Fastify from 'fastify';
+import { Server } from 'socket.io';
+import { createServer } from 'http';
+import { registerSocket } from './socket.js';
+
+const fastify = Fastify();
+const httpServer = createServer(fastify.server);
+const io = new Server(httpServer, { cors: { origin: '*' } });
+const hub = registerSocket(io);
+
+fastify.get('/health', async () => ({ ok: true }));
+fastify.get('/replay/:id', async (req, reply) => {
+  const id = (req.params as any).id as string;
+  const data = hub.getReplay(id);
+  if (!data) return reply.code(404).send({ error: 'not_found' });
+  reply.header('content-type', 'application/json');
+  return data;
+});
+
+const PORT = Number(process.env.PORT || 8787);
+httpServer.listen(PORT, () => console.log('Chroma Clash server on', PORT));
+
+4) Tests — jump-in, 7-0 rotation, shield, surge legality
+client/src/rules/engine.jumpin.test.ts
+import { describe, it, expect } from 'vitest';
+import { newGame, step } from './engine';
+import { DEFAULT_VARIANTS } from './variants';
+import type { TableState, Card } from './types';
+
+describe('jump-in', () => {
+  it('allows out-of-turn identical play and transfers turn', () => {
+    const g = newGame(['A','B','C'], 'seed', { ...DEFAULT_VARIANTS, jumpIn: true });
+    const s: TableState = structuredClone(g);
+    // Make top a red 5; give player 2 a red 5
+    const top: Card = { kind:'number', color:'red', value:5 };
+    s.discardPile.push(top); s.topCard = top; s.topColor = 'red';
+    s.players[1].hand.push({ kind:'number', color:'red', value:5 });
+    const before = s.current; // 0
+    const s1 = step(s, { t:'jumpIn', playerIndex: 1, cardIndex: s.players[1].hand.length-1 });
+    expect(s1.current).not.toBe(before);
+    expect(s1.discardPile.at(-1)).toMatchObject({ kind:'number', color:'red', value:5 });
+  });
+});
+client/src/rules/engine.sevenzero.test.ts
+import { describe, it, expect } from 'vitest';
+import { newGame, step } from './engine';
+import { DEFAULT_VARIANTS } from './variants';
+import type { TableState } from './types';
+
+describe('7-0 rotation', () => {
+  it('plays 0 and rotates hands in direction', () => {
+    const g = newGame(['A','B','C'], 'seed', { ...DEFAULT_VARIANTS, sevenZero: true });
+    const s: TableState = structuredClone(g);
+    s.topColor = 'red';
+    s.topCard = { kind:'number', color:'red', value:0 };
+    s.players[0].hand.push({ kind:'number', color:'red', value:0 });
+    const lenA = s.players[0].hand.length, lenB = s.players[1].hand.length;
+    const s1 = step(s, { t:'play', cardIndex: s.players[0].hand.length-1 });
+    // After 0, each hand moved one seat; A's previous cards now with B
+    expect(s1.players[1].hand.length).toBe(lenA); // simplistic length check
+    expect(s1.players[0].hand.length).toBe(lenB); // simplistic length check
+  });
+});
+client/src/rules/engine.shield.test.ts
+import { describe, it, expect } from 'vitest';
+import { newGame, step } from './engine';
+import { DEFAULT_VARIANTS } from './variants';
+import type { TableState } from './types';
+
+describe('shield intercepts pending draw', () => {
+  it('consumes shield to ignore +2', () => {
+    const g = newGame(['A','B'], 'seed', DEFAULT_VARIANTS);
+    const s: TableState = structuredClone(g);
+    s.topColor = 'red';
+    s.players[1].power.kind = 'shield'; s.players[1].power.meter = 3; s.players[1].power.armed = true;
+    s.players[0].hand.push({ kind:'action', color:'red', symbol:'+2' });
+    const s1 = step(s, { t: 'play', cardIndex: s.players[0].hand.length-1 });
+    // Advance applied in step(); B should not draw due to shield
+    expect(s1.players[1].power.armed).toBe(false);
+  });
+});
+client/src/rules/engine.surge.test.ts
+import { describe, it, expect } from 'vitest';
+import { newGame, step } from './engine';
+import { DEFAULT_VARIANTS } from './variants';
+import type { TableState } from './types';
+
+describe('surge force-color', () => {
+  it('forces next legal play to chosen color', () => {
+    const g = newGame(['A','B'], 'seed', DEFAULT_VARIANTS);
+    const s: TableState = structuredClone(g);
+    s.players[0].power = { kind:'surge', meter:3, armed:false };
+    const s1 = step(s, { t: 'firePower', chooseColor: 'blue' });
+    expect(s1.forceColor?.color).toBe('blue');
+    // Give A a non-blue that would normally match by number
+    s1.topCard = { kind:'number', color:'red', value:3 }; s1.topColor = 'red';
+    s1.players[0].hand = [{ kind:'number', color:'red', value:3 }];
+    // Should NOT be able to play red due to forceColor blue (legalMoves internal)
+    const s2 = step(s1, { t: 'play', cardIndex: 0 });
+    expect(s2).toBe(s1); // illegal, state unchanged
+  });
+});
+
+5) Minor tweaks — package & imports
+* Ensure client/src/themes/index.ts is imported somewhere (it’s used from Settings).
+* No additional dependencies required.
+
+6) Developer notes
+* Jump-In UX: In multiplayer, jump-in is best handled by the server broadcasting a jump window. Here we optimistically allow jumpIn intent validated server-side (same isIdentical).
+* Round progression: We mark roundEnd/gameOver; a follow-up could add nextRound() to reshuffle/deal with dealer rotation.
+* Card backs: Stored as CSS classes; a real game would persist user choice and apply class to Card back faces (we’re front-facing for now).
+
+7) Updated Acceptance status (delta)
+* ✅ Jump-In variant validated with intent & tests.
+* ✅ Scoring and Game Over paths added (toggle via variants.scoring).
+* ✅ Wild color UI (ColorPicker) and Surge choose-color.
+* ✅ Replay endpoint /replay/:roomId.
+* ✅ AFK ghost flag toggled after 45s idle (server emits state with isGhost).
+* ☐ Lobby → remote gameplay parity (client still uses local bots in GameScreen; remote intents not bound yet).
+* ☐ Narration (ARIA live region), hand virtualization, and PWA icons — still to go.
+
+8) Run it
+* Client: cd client && npm i && npm run dev
+* Server: cd server && npm i && npm run dev
+* Join a room in Lobby, hit Start Remote to receive server state in the client store.
+
+9) Continuation Protocol
+NEXT:
+* client/src/net/bindRemote.ts (bind GameScreen to SocketClient intents & state)
+* client/src/ui/components/AriaLive.tsx (SR narration of plays & timers)
+* client/src/ui/components/HandVirtual.tsx (virtualized hand for 12+ cards)
+* client/public/manifest.webmanifest (icons array) + /public/icons/*
+* client/src/ui/components/Card (apply selectable card back faces)
+* client/src/rules/engine.ts (nextRound() & dealer rotation; scoring UI in Results screen)
+* client/src/ui/screens/Results.tsx (round summary, scores)
+* More tests: remote jump-in arbitration, next-round dealer, results scoring view.
